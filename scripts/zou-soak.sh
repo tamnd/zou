@@ -6,9 +6,13 @@
 # Three failure modes rotate:
 #   crash   kill -9 the postmaster, zou dev restarts it in place and
 #           recovery replays, the recover-and-continue path
-#   death   kill -9 zou dev and every postgres under it, then attach a
-#           fresh instance from the store alone, which also exercises
-#           taking over the dead node's expired lease
+#   death   kill -9 zou dev and the postmaster, then attach a fresh
+#           instance from the store alone, which also exercises taking
+#           over the dead node's expired lease. The postmaster's
+#           children are left to notice on their own, because that is
+#           what killing a postmaster does and a node that only fails
+#           over cleanly when every last process is already gone is a
+#           node that does not fail over
 #   steal   while the writer is alive and heartbeating, attach a second
 #           instance and try to write through it, any acked write there
 #           would be split brain
@@ -50,6 +54,13 @@ start_dev() {
 	DEVPID=$!
 }
 
+# The pattern matches the postmaster, whose command line carries the
+# runtime directory, and nothing else: postgres rewrites the command
+# line of every child it forks, so a backend or a background worker
+# reads as "postgres: zou wal pusher" and is never a match. That is on
+# purpose. The children are orphans a moment later and have to stop
+# themselves, which is the same thing that happens when a postmaster is
+# killed anywhere else.
 kill_node() {
 	kill -9 "$DEVPID" 2>/dev/null || true
 	pkill -9 -f "$RT" 2>/dev/null || true

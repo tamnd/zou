@@ -1,0 +1,138 @@
+Wait out a predecessor that is still dying.
+
+A pusher that finds the writer lease held retries until the store lets
+it in, and patch 0023 gave it the right bound: wait as far out as the
+expiry the store reports, and stop early if that expiry is seen to move,
+because a lease being renewed is a node that is alive and this cluster
+has been replaced.
+
+Seen to move once is not proof. A node killed hard does not stop the
+instant it is killed. Its renewal thread lives in a process that runs
+until whatever store call it is inside of returns, so a cluster that is
+already dead can push its expiry forward two or three more times while
+the node taking over is asking for the lease. That is what the soak
+caught at iteration 5: the whole node killed at 08:24:05, the fresh
+attach asking from 08:24:21, the dead node's expiry moving at 08:24:19
+and again at 08:24:24, and the successor calling that a live rival and
+shutting itself down four seconds into a takeover nobody was contending.
+The lease holder in the refusal was the dead node's own data directory,
+which is how it was pinned down.
+
+What a dying holder cannot do is keep it up. Its renewals stop when its
+process does, which is seconds, while a node that is really running
+renews for as long as it runs. So the exit now wants the expiry to keep
+advancing for thirty seconds, two busy TTLs, rather than to advance
+once. A thaw still stops, half a minute later than before and long
+before a client has given up on it, and a failover no longer stops at
+all.
+
+The other half of this fix is in the crate, where the renewal thread now
+stops the first time it wakes up in a process the postmaster has left
+behind. This side stands on its own: it is the successor's judgement,
+and it should not depend on every predecessor being well behaved.
+
+diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
+index 9199c7d..979282d 100644
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -360,6 +360,22 @@ zou_lease_wait_secs(void)
+  */
+ #define ZOU_LEASE_EXPIRY_GRACE 5
+ 
++/*
++ * How long the expiry has to keep moving before a waiter calls the
++ * holder alive rather than dying.
++ *
++ * One move is not enough. A node killed hard leaves its renewal thread
++ * running for as long as the store call it was inside of takes to
++ * return, so the expiry of a cluster that is already gone can advance a
++ * few more times while its successor is asking, and treating the first
++ * of those as proof of a live node makes the successor stop on the very
++ * failover it exists to perform. What a dying holder cannot do is keep
++ * it up: its renewals stop when its process does. Thirty seconds is two
++ * busy TTLs, longer than any wind down and short enough that a cluster
++ * that really has been replaced stops before a client gives up on it.
++ */
++#define ZOU_LEASE_MOVING_SECS 30
++
+ /*
+  * How long a stopping pusher spends getting the store a checkpoint worth
+  * starting from, before it gives up and goes anyway.
+@@ -399,6 +415,7 @@ ZouWalPusherMain(Datum main_arg)
+ 	int			fold_backoff = 0;
+ 	int			waited;
+ 	uint64		expiry_seen = 0;
++	pg_time_t	moving_since = 0;
+ 	uint64		resume = 0;
+ 	char	   *buf;
+ 
+@@ -447,13 +464,21 @@ ZouWalPusherMain(Datum main_arg)
+ 	 * held and cannot even be cancelled.
+ 	 *
+ 	 * What tells those two apart is the expiry the store reports and not
+-	 * a count of seconds here. A holder that is gone wrote its expiry
+-	 * once and nothing moves it again, so a frozen expiry is waited out
+-	 * however far out it is, which is five minutes when the predecessor
+-	 * died with its project idle. A holder that is alive pushes the
+-	 * expiry forward every renewal, and one seen to advance is the
+-	 * successor this bound exists for, so this stops on it at once
+-	 * rather than after another minute of asking.
++	 * a count of seconds here. A holder that is gone stops moving its
++	 * expiry, so a frozen one is waited out however far out it is, which
++	 * is five minutes when the predecessor died with its project idle. A
++	 * holder that is alive pushes it forward every renewal, and one that
++	 * keeps advancing for ZOU_LEASE_MOVING_SECS is the successor this
++	 * bound exists for.
++	 *
++	 * The window is the part that had to be learned. A predecessor
++	 * killed hard does not stop the instant it is killed: its renewal
++	 * thread runs until the store call it was inside of returns, so a
++	 * cluster that is already dead can move its expiry two or three more
++	 * times while the node taking over is asking. Reading the first of
++	 * those as a live successor made a takeover stop four seconds in, on
++	 * a lease nobody would ever renew again. Renewals that are still
++	 * arriving half a minute later are a node that is running.
+ 	 *
+ 	 * The count is still the bound when the store reports no expiry
+ 	 * worth waiting on, which is a lease whose clock put it further out
+@@ -477,18 +502,30 @@ ZouWalPusherMain(Datum main_arg)
+ 		{
+ 			/*
+ 			 * The expiry moved, so something wrote the lease while this
+-			 * node was waiting on it, and a lease being written is a
+-			 * node that is alive. Forward is the holder renewing and
++			 * node was waiting on it. Forward is the holder renewing and
+ 			 * backward is a third node that got in first with a shorter
+-			 * ttl; either way this cluster is not the writer. Same exit
+-			 * as the bound below and for the same reason, taken as soon
+-			 * as there is proof rather than after waiting for the proof
+-			 * to age.
++			 * ttl. Note when the moving started and let it go on: a
++			 * predecessor that has not finished dying moves it a few
++			 * times too, and the two are the same sight until one of
++			 * them stops.
+ 			 */
+-			ereport(WARNING,
+-					(errmsg("zou wal pusher: the writer lease was written again while this cluster waited for it, so a live node holds it and this cluster has been replaced and is stopping")));
+-			kill(PostmasterPid, SIGQUIT);
+-			proc_exit(1);
++			pg_time_t	now = timestamptz_to_time_t(GetCurrentTimestamp());
++
++			if (moving_since == 0)
++				moving_since = now;
++			else if (now - moving_since >= ZOU_LEASE_MOVING_SECS)
++			{
++				/*
++				 * Still being renewed after a window no wind down
++				 * covers, so a live node holds it. Same exit as the
++				 * bound below and for the same reason.
++				 */
++				ereport(WARNING,
++						(errmsg("zou wal pusher: the writer lease has been renewed for %d seconds while this cluster waited for it, so a live node holds it and this cluster has been replaced and is stopping",
++								(int) (now - moving_since))));
++				kill(PostmasterPid, SIGQUIT);
++				proc_exit(1);
++			}
+ 		}
+ 		if (until != 0)
+ 			expiry_seen = until;
