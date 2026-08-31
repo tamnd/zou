@@ -217,6 +217,13 @@ pub struct Cases {
     /// that name rather than under Supabase's.
     #[serde(default = "anon")]
     pub anon_role: String,
+    /// Whether the project these cases are asked as has anonymous sign
+    /// in turned on. It is off in a Supabase project that has changed
+    /// nothing, so it is off here unless a suite says otherwise, and the
+    /// suite that says otherwise is recorded from a reference started
+    /// with the matching flag rather than from the one next to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anonymous_users: bool,
     /// The person the suite seeded, when it seeded one. The `user` key
     /// is an access token for them, minted from the same secret every
     /// target is configured with, so a case can ask an endpoint that

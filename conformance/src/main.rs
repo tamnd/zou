@@ -89,6 +89,9 @@ serving
                            default public
   --anon-role <role>       the role a request with no role of its own runs
                            as, default anon
+  --anonymous-users        let somebody sign in without saying who they
+                           are, which is off in a project that has changed
+                           nothing and is what the auth-anon suite says
   --setup <path>           a sql file to apply once the server is up, which
                            is where the fixture of a suite asked elsewhere
                            goes. Applied after the auth schema exists, so it
@@ -175,6 +178,7 @@ struct Args {
     port: u16,
     schemas: Vec<String>,
     anon_role: String,
+    anonymous_users: bool,
     setup_sql: Option<String>,
     reports: Vec<String>,
     js: Vec<String>,
@@ -214,6 +218,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         port: 54321,
         schemas: vec!["public".to_string()],
         anon_role: "anon".to_string(),
+        anonymous_users: false,
         setup_sql: None,
         reports: Vec::new(),
         js: Vec::new(),
@@ -281,6 +286,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                     .map_err(|_| format!("--port takes a number, not {value:?}"))?;
             }
             "--anon-role" => args.anon_role = need("--anon-role")?,
+            "--anonymous-users" => args.anonymous_users = true,
             "--schemas" => {
                 args.schemas = need("--schemas")?
                     .split(',')
@@ -462,8 +468,11 @@ fn run(args: Args) -> Result<bool, String> {
             Some(dsn) => Some(zou::start(
                 dsn,
                 args.jwt_secret.as_bytes(),
-                &suite.cases.schemas,
-                &suite.cases.anon_role,
+                zou::Shape {
+                    schemas: &suite.cases.schemas,
+                    anon_role: &suite.cases.anon_role,
+                    anonymous_users: suite.cases.anonymous_users,
+                },
                 s3_pair(&args.s3_key, &args.s3_secret),
             )?),
             None => None,
@@ -643,6 +652,19 @@ fn s3_pair(access: &str, secret: &str) -> zou_server::s3::Credentials {
 /// fixture with a foreign key into auth.users would otherwise be a race
 /// against the server's own bootstrap. start_at does not come back until
 /// that has happened.
+/// How a served node is configured, which is what the flags say and
+/// nothing else. There is no suite to read here: serving is for a suite
+/// asked over somebody else's client, and all that one is handed is a
+/// url, so what a `cases.json` would have said has to be said on the
+/// command line instead.
+fn served_as(args: &Args) -> zou::Shape<'_> {
+    zou::Shape {
+        schemas: &args.schemas,
+        anon_role: &args.anon_role,
+        anonymous_users: args.anonymous_users,
+    }
+}
+
 fn holding(args: &Args) -> Result<bool, String> {
     let dsn = args.zou_dsn.as_deref().expect("parse checked for one");
     // With --fan-out, the node the suite is pointed at is not the node
@@ -655,8 +677,7 @@ fn holding(args: &Args) -> Result<bool, String> {
         true => Some(zou::start(
             dsn,
             args.jwt_secret.as_bytes(),
-            &args.schemas,
-            &args.anon_role,
+            served_as(args),
             s3_pair(&args.s3_key, &args.s3_secret),
         )?),
     };
@@ -665,8 +686,7 @@ fn holding(args: &Args) -> Result<bool, String> {
         dsn,
         holder.as_ref().map(|held| held.url.as_str()),
         args.jwt_secret.as_bytes(),
-        &args.schemas,
-        &args.anon_role,
+        served_as(args),
         s3_pair(&args.s3_key, &args.s3_secret),
     )?;
     if let Some(path) = &args.setup_sql {
