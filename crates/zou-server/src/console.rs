@@ -1,6 +1,6 @@
 //! The web admin at `/_zou`.
 //!
-//! One page and three endpoints, served by the same binary that serves
+//! One page and five endpoints, served by the same binary that serves
 //! the project. There is no build step, no bundler and nothing fetched
 //! from a CDN: the page is a single file compiled into the binary, so
 //! an operator who can reach the server can reach the console, on a box
@@ -81,12 +81,12 @@ select n.nspname::text as schema,
    and has_table_privilege(c.oid, 'select')
  order by n.nspname, c.relname, a.attnum";
 
-/// One page of the user list.
+/// One page of any of the lists below.
 ///
 /// Fifty is what fits on a screen without scrolling past what a person
-/// came to look at, and the list is ordered newest first, so the ones
-/// worth looking at are almost always on the first page.
-const USERS_PAGE: i64 = 50;
+/// came to look at, and every list is ordered so that the rows worth
+/// looking at are almost always on the first page.
+const LIST_PAGE: i64 = 50;
 
 /// A page of `auth.users` with the providers each of them signed in
 /// with.
@@ -123,6 +123,61 @@ select u.id::text as id,
     or u.id::text ilike $2::text
  order by u.created_at desc nulls last, u.id
  limit $3::bigint offset $4::bigint";
+
+/// Every bucket, with the settings that decide what an upload to it is
+/// allowed to be.
+///
+/// No object count and no total size, on purpose and for the reason the
+/// sidebar prints an estimate rather than a count: a bucket holds as
+/// many rows as somebody has uploaded, there is no index that answers
+/// how many or how large without reading all of them, and a listing
+/// that did it would spend a project's storage table on a column of
+/// numbers nobody asked for. What a person opening this wants first is
+/// which buckets exist and which of them are public, and both of those
+/// are one short row each.
+///
+/// Unpaged, because buckets come in the dozens. A project with more of
+/// them than fit on a screen is one nobody has yet.
+const BUCKETS: &str = "\
+select b.id::text as id,
+       b.name::text as name,
+       b.public as public,
+       b.type::text as type,
+       b.file_size_limit as file_size_limit,
+       b.allowed_mime_types as allowed_mime_types,
+       date_trunc('second', b.created_at)::text as created_at,
+       date_trunc('second', b.updated_at)::text as updated_at
+  from storage.buckets b
+ order by b.id";
+
+/// One page of a bucket's objects, in name order.
+///
+/// Name order because that is what a listing of files is, and because
+/// `bucketid_objname` is an index on exactly that, so a page deep into
+/// a large bucket is read rather than sorted. Newest first would be the
+/// other defensible order and would cost a sort of the whole bucket to
+/// produce the first fifty rows.
+///
+/// The size and the content type come out of the metadata the storage
+/// api wrote when the object was uploaded, so both are whatever is
+/// there and neither is guaranteed. The size is matched against digits
+/// before it is cast: an object whose metadata somebody wrote by hand
+/// should read as a size nobody knows, not take the listing down with a
+/// failed cast.
+const OBJECTS: &str = "\
+select o.id::text as id,
+       o.name::text as name,
+       case when o.metadata->>'size' ~ '^[0-9]+$'
+            then (o.metadata->>'size')::bigint end as size,
+       o.metadata->>'mimetype' as mimetype,
+       o.version::text as version,
+       date_trunc('second', o.created_at)::text as created_at,
+       date_trunc('second', o.updated_at)::text as updated_at
+  from storage.objects o
+ where o.bucket_id = $1::text
+   and ($2::text = '' or o.name ilike $3::text)
+ order by o.name
+ limit $4::bigint offset $5::bigint";
 
 /// What the console will not run in one request, in bytes. Large
 /// enough for a migration somebody pasted in, small enough that a
@@ -193,22 +248,79 @@ fn refused(status: StatusCode, message: &str) -> Response {
     json_body(status, serde_json::json!({ "error": message }))
 }
 
+/// The three things every endpoint below settles before it looks at
+/// what was actually asked for: the console is switched on, the caller
+/// is the service role, and there is a database behind this server.
+fn admitted<'a>(app: &'a App, req: &Request<Body>) -> Result<&'a crate::sql::Pool, Box<Response>> {
+    if !app.cfg.console {
+        return Err(Box::new(crate::kong_no_route()));
+    }
+    service_role(app, req)?;
+    match &app.pool {
+        Some(pool) => Ok(pool),
+        None => Err(Box::new(refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This server has no database attached.",
+        ))),
+    }
+}
+
+/// What a listing takes off the query string: something to search for,
+/// the pattern that becomes, and which page of the answer to cut.
+struct Asked {
+    term: String,
+    like: String,
+    page: i64,
+}
+
+fn asked(query: &serde_json::Value) -> Asked {
+    let term = query["q"].as_str().unwrap_or("").trim().to_string();
+    // The term is a term and not a pattern: somebody searching for
+    // `a_b@example.com` means that address and not any address with a
+    // character where the underscore is.
+    let like = format!(
+        "%{}%",
+        term.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let page = query["page"]
+        .as_str()
+        .and_then(|p| p.parse().ok())
+        .filter(|p| *p >= 0)
+        .unwrap_or(0);
+    Asked { term, like, page }
+}
+
+/// Whether a relation is there to be read.
+///
+/// Bootstrap makes every relation asked about below on each database
+/// this server opens, so a no here means somebody dropped the schema,
+/// which is a strange state to be in and a worse one to read a 42P01
+/// about. The lists answer it as an empty page that says so.
+async fn present(
+    sess: &crate::sql::Session,
+    relation: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let rows = sess
+        .query(
+            "select to_regclass($1::text) is not null as present",
+            &[&relation],
+        )
+        .await?;
+    Ok(rows
+        .first()
+        .is_some_and(|row| row.get::<_, bool>("present")))
+}
+
 /// GET /_zou/api/catalog, every relation the connecting role can read.
 pub async fn catalog(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     req: Request<Body>,
 ) -> Response {
-    if !app.cfg.console {
-        return crate::kong_no_route();
-    }
-    if let Err(res) = service_role(&app, &req) {
-        return *res;
-    }
-    let Some(pool) = &app.pool else {
-        return refused(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "This server has no database attached.",
-        );
+    let pool = match admitted(&app, &req) {
+        Ok(pool) => pool,
+        Err(res) => return *res,
     };
     let sess = match pool.unscoped().await {
         Ok(sess) => sess,
@@ -300,74 +412,41 @@ fn group(rows: &[tokio_postgres::Row]) -> serde_json::Value {
 ///
 /// A database with no `auth.users` on it answers with an empty list
 /// that says so rather than with postgres's words about a relation that
-/// does not exist. Bootstrap makes that table on every database this
-/// server opens, so the only way to be here is a database somebody
-/// dropped the schema on, which is a strange state to be in and a worse
-/// one to read a 42P01 about.
+/// does not exist.
 pub async fn users(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     req: Request<Body>,
 ) -> Response {
-    if !app.cfg.console {
-        return crate::kong_no_route();
-    }
-    if let Err(res) = service_role(&app, &req) {
-        return *res;
-    }
-    let Some(pool) = &app.pool else {
-        return refused(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "This server has no database attached.",
-        );
+    let pool = match admitted(&app, &req) {
+        Ok(pool) => pool,
+        Err(res) => return *res,
     };
     let query = crate::auth::query_object(req.uri().query().unwrap_or_default());
-    let term = query["q"].as_str().unwrap_or("").trim().to_string();
-    let page: i64 = query["page"]
-        .as_str()
-        .and_then(|p| p.parse().ok())
-        .filter(|p| *p >= 0)
-        .unwrap_or(0);
+    let Asked { term, like, page } = asked(&query);
     let sess = match pool.unscoped().await {
         Ok(sess) => sess,
         Err(e) => return refused(StatusCode::BAD_GATEWAY, &e.to_string()),
     };
-    let present = match sess
-        .query(
-            "select to_regclass('auth.users') is not null as present",
-            &[],
-        )
-        .await
-    {
-        Ok(rows) => rows
-            .first()
-            .is_some_and(|row| row.get::<_, bool>("present")),
+    match present(&sess, "auth.users").await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = sess.commit().await;
+            return json_body(
+                StatusCode::OK,
+                serde_json::json!({ "users": [], "more": false, "absent": true }),
+            );
+        }
         Err(e) => {
             let _ = sess.rollback().await;
             return refused(StatusCode::BAD_GATEWAY, &e.to_string());
         }
-    };
-    if !present {
-        let _ = sess.commit().await;
-        return json_body(
-            StatusCode::OK,
-            serde_json::json!({ "users": [], "more": false, "absent": true }),
-        );
     }
     // One more than a page, so the page knows whether there is a next
     // one without counting a table it does not otherwise read.
-    // The term is a term and not a pattern: somebody searching for
-    // `a_b@example.com` means that address and not any address with a
-    // character where the underscore is.
-    let like = format!(
-        "%{}%",
-        term.replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    );
     let rows = match sess
         .query(
             USERS,
-            &[&term, &like, &(USERS_PAGE + 1), &(page * USERS_PAGE)],
+            &[&term, &like, &(LIST_PAGE + 1), &(page * LIST_PAGE)],
         )
         .await
     {
@@ -380,10 +459,10 @@ pub async fn users(
     if let Err(e) = sess.commit().await {
         return refused(StatusCode::BAD_GATEWAY, &e.to_string());
     }
-    let more = rows.len() as i64 > USERS_PAGE;
+    let more = rows.len() as i64 > LIST_PAGE;
     let listed: Vec<serde_json::Value> = rows
         .iter()
-        .take(USERS_PAGE as usize)
+        .take(LIST_PAGE as usize)
         .map(|row| {
             serde_json::json!({
                 "id": row.get::<_, String>("id"),
@@ -404,6 +483,151 @@ pub async fn users(
     )
 }
 
+/// GET /_zou/api/buckets, what the project keeps files in.
+///
+/// The other half of "what is in this project" that the sql editor
+/// answers badly. A bucket and its objects are two rows in two tables
+/// somebody has to know the shape of, and the question underneath is
+/// usually one of two: is this bucket public, and did that upload
+/// actually land.
+pub async fn buckets(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let pool = match admitted(&app, &req) {
+        Ok(pool) => pool,
+        Err(res) => return *res,
+    };
+    let sess = match pool.unscoped().await {
+        Ok(sess) => sess,
+        Err(e) => return refused(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    match present(&sess, "storage.buckets").await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = sess.commit().await;
+            return json_body(
+                StatusCode::OK,
+                serde_json::json!({ "buckets": [], "absent": true }),
+            );
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    }
+    let rows = match sess.query(BUCKETS, &[]).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
+    if let Err(e) = sess.commit().await {
+        return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+    }
+    let listed: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<_, String>("id"),
+                "name": row.get::<_, String>("name"),
+                "public": row.get::<_, Option<bool>>("public").unwrap_or(false),
+                "type": row.get::<_, Option<String>>("type"),
+                "file_size_limit": row.get::<_, Option<i64>>("file_size_limit"),
+                "allowed_mime_types": row.get::<_, Option<Vec<String>>>("allowed_mime_types"),
+                "created_at": row.get::<_, Option<String>>("created_at"),
+                "updated_at": row.get::<_, Option<String>>("updated_at"),
+            })
+        })
+        .collect();
+    json_body(StatusCode::OK, serde_json::json!({ "buckets": listed }))
+}
+
+/// GET /_zou/api/objects, a page of one bucket.
+///
+/// One bucket and not all of them, because there is no such thing as a
+/// useful listing of every object a project has: the buckets are the
+/// only division the storage api gives, and a person looking for a file
+/// already knows which one they put it in.
+pub async fn objects(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let pool = match admitted(&app, &req) {
+        Ok(pool) => pool,
+        Err(res) => return *res,
+    };
+    let query = crate::auth::query_object(req.uri().query().unwrap_or_default());
+    let bucket = query["bucket"].as_str().unwrap_or("").trim().to_string();
+    if bucket.is_empty() {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "Say which bucket to list, as ?bucket=name.",
+        );
+    }
+    let Asked { term, like, page } = asked(&query);
+    let sess = match pool.unscoped().await {
+        Ok(sess) => sess,
+        Err(e) => return refused(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    match present(&sess, "storage.objects").await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = sess.commit().await;
+            return json_body(
+                StatusCode::OK,
+                serde_json::json!({ "objects": [], "more": false, "absent": true }),
+            );
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    }
+    let rows = match sess
+        .query(
+            OBJECTS,
+            &[&bucket, &term, &like, &(LIST_PAGE + 1), &(page * LIST_PAGE)],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
+    if let Err(e) = sess.commit().await {
+        return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+    }
+    let more = rows.len() as i64 > LIST_PAGE;
+    let listed: Vec<serde_json::Value> = rows
+        .iter()
+        .take(LIST_PAGE as usize)
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<_, String>("id"),
+                "name": row.get::<_, Option<String>>("name"),
+                "size": row.get::<_, Option<i64>>("size"),
+                "mimetype": row.get::<_, Option<String>>("mimetype"),
+                "version": row.get::<_, Option<String>>("version"),
+                "created_at": row.get::<_, Option<String>>("created_at"),
+                "updated_at": row.get::<_, Option<String>>("updated_at"),
+            })
+        })
+        .collect();
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({
+            "bucket": bucket,
+            "objects": listed,
+            "page": page,
+            "more": more,
+        }),
+    )
+}
+
 /// POST /_zou/api/sql, run what the editor holds.
 ///
 /// The simple protocol, so a person can paste several statements and
@@ -416,17 +640,9 @@ pub async fn run(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     req: Request<Body>,
 ) -> Response {
-    if !app.cfg.console {
-        return crate::kong_no_route();
-    }
-    if let Err(res) = service_role(&app, &req) {
-        return *res;
-    }
-    let Some(pool) = &app.pool else {
-        return refused(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "This server has no database attached.",
-        );
+    let pool = match admitted(&app, &req) {
+        Ok(pool) => pool,
+        Err(res) => return *res,
     };
     let body = match axum::body::to_bytes(req.into_body(), MAX_QUERY).await {
         Ok(body) => body,
@@ -576,5 +792,21 @@ mod tests {
         assert!(!PAGE.contains("https://"));
         assert!(PAGE.contains("/_zou/api/sql"));
         assert!(PAGE.contains("/_zou/api/users?q="));
+        assert!(PAGE.contains("/_zou/api/buckets"));
+        assert!(PAGE.contains("/_zou/api/objects?bucket="));
+    }
+
+    #[test]
+    fn a_search_term_is_escaped_into_a_pattern_that_matches_it_literally() {
+        let for_a_discount = asked(&serde_json::json!({ "q": " 50%_off ", "page": "2" }));
+        assert_eq!(for_a_discount.term, "50%_off");
+        assert_eq!(for_a_discount.like, "%50\\%\\_off%");
+        assert_eq!(for_a_discount.page, 2);
+        // A page nobody named is the first one, and a page below the
+        // first one does not exist, so both read as zero rather than as
+        // a negative offset postgres would refuse.
+        assert_eq!(asked(&serde_json::json!({})).page, 0);
+        assert_eq!(asked(&serde_json::json!({ "page": "-3" })).page, 0);
+        assert_eq!(asked(&serde_json::json!({ "page": "many" })).page, 0);
     }
 }

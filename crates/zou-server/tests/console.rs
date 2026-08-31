@@ -374,6 +374,234 @@ async fn a_list_longer_than_a_page_says_there_is_another_one() {
     forget_users(&dsn, tag).await;
 }
 
+/// Whatever a console GET answers with, as json.
+async fn fetched(app: &axum::Router, path: &str) -> serde_json::Value {
+    let req = Request::builder()
+        .uri(path)
+        .header("authorization", format!("Bearer {}", service_key()))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "console refused {path}");
+    let bytes = to_bytes(res.into_body(), 1 << 22).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Let this connection delete storage rows.
+///
+/// The schema puts a trigger in front of both storage tables that
+/// refuses a delete unless the session says it means it, so that a
+/// stray statement cannot orphan the files behind the rows. A test
+/// clearing up after itself is the case the setting is there for. Set
+/// for the session and not for the transaction, because an unscoped
+/// checkout has no transaction to set it in and `set local` in one
+/// would be a warning and no setting.
+async fn allow_delete(sess: &zou_server::sql::Session) {
+    sess.execute(
+        "select set_config('storage.allow_delete_query', 'true', false)",
+        &[],
+    )
+    .await
+    .expect("allow the cleanup");
+}
+
+/// A bucket with `how_many` objects in it, named so a search can find
+/// them and nothing else.
+async fn seed_bucket(dsn: &str, bucket: &str, how_many: usize) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    allow_delete(&sess).await;
+    sess.execute(
+        "delete from storage.objects where bucket_id = $1",
+        &[&bucket],
+    )
+    .await
+    .expect("clear the bucket");
+    sess.execute(
+        "insert into storage.buckets (id, name, public, file_size_limit,
+                                      allowed_mime_types)
+         values ($1, $1, true, 1048576, array['image/png'])
+         on conflict (id) do update set public = excluded.public,
+                                        file_size_limit = excluded.file_size_limit,
+                                        allowed_mime_types = excluded.allowed_mime_types",
+        &[&bucket],
+    )
+    .await
+    .expect("make the bucket");
+    for n in 0..how_many {
+        // Zero padded, because the list comes back in name order and a
+        // test that asserts on it should not be asserting on whether
+        // ten sorts before two.
+        let name = format!("folder/file-{n:03}.png");
+        sess.execute(
+            "insert into storage.objects (bucket_id, name, metadata, version)
+             values ($1, $2, jsonb_build_object('size', $3::bigint,
+                                                'mimetype', 'image/png'),
+                     'v1')",
+            &[&bucket, &name, &(2048_i64)],
+        )
+        .await
+        .expect("insert an object");
+    }
+    sess.commit().await.expect("park");
+}
+
+async fn forget_bucket(dsn: &str, bucket: &str) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    allow_delete(&sess).await;
+    sess.execute(
+        "delete from storage.objects where bucket_id = $1",
+        &[&bucket],
+    )
+    .await
+    .expect("delete the objects");
+    sess.execute("delete from storage.buckets where id = $1", &[&bucket])
+        .await
+        .expect("delete the bucket");
+    sess.commit().await.expect("park");
+}
+
+#[tokio::test]
+async fn the_bucket_list_says_what_an_upload_to_each_one_may_be() {
+    let Some(dsn) = dsn() else { return };
+    let name = "consolebucketone";
+    seed_bucket(&dsn, name, 1).await;
+    let app = app(&dsn);
+
+    let body = fetched(&app, "/_zou/api/buckets").await;
+    let bucket = body["buckets"]
+        .as_array()
+        .expect("buckets")
+        .iter()
+        .find(|b| b["id"] == name)
+        .expect("the bucket just made")
+        .clone();
+    assert_eq!(bucket["name"], name);
+    assert_eq!(bucket["public"], true);
+    assert_eq!(bucket["type"], "STANDARD");
+    assert_eq!(bucket["file_size_limit"], 1048576);
+    assert_eq!(
+        bucket["allowed_mime_types"],
+        serde_json::json!(["image/png"])
+    );
+    // No count and no total, deliberately: a bucket holds as many rows
+    // as somebody uploaded and there is no index that answers how many
+    // without reading all of them.
+    assert_eq!(bucket["objects"], serde_json::Value::Null);
+
+    forget_bucket(&dsn, name).await;
+}
+
+#[tokio::test]
+async fn a_bucket_lists_its_files_in_name_order_with_the_size_it_recorded() {
+    let Some(dsn) = dsn() else { return };
+    let name = "consolebuckettwo";
+    seed_bucket(&dsn, name, 3).await;
+    let app = app(&dsn);
+
+    let body = fetched(&app, &format!("/_zou/api/objects?bucket={name}&q=&page=0")).await;
+    assert_eq!(body["bucket"], name);
+    let objects = body["objects"].as_array().expect("objects");
+    assert_eq!(objects.len(), 3);
+    assert_eq!(objects[0]["name"], "folder/file-000.png");
+    assert_eq!(objects[2]["name"], "folder/file-002.png");
+    assert_eq!(objects[0]["size"], 2048);
+    assert_eq!(objects[0]["mimetype"], "image/png");
+    assert_eq!(objects[0]["version"], "v1");
+    assert_eq!(body["more"], false);
+
+    // The search is over the name and matches part of it, which is
+    // what somebody has when they are looking for one file out of a
+    // bucket full of them.
+    let one = fetched(
+        &app,
+        &format!("/_zou/api/objects?bucket={name}&q=file-001&page=0"),
+    )
+    .await;
+    assert_eq!(one["objects"].as_array().expect("objects").len(), 1);
+
+    // Another bucket's files are not this bucket's files.
+    let other = fetched(&app, "/_zou/api/objects?bucket=no-such-bucket&q=&page=0").await;
+    assert_eq!(other["objects"].as_array().expect("objects").len(), 0);
+
+    forget_bucket(&dsn, name).await;
+}
+
+#[tokio::test]
+async fn a_size_nobody_wrote_is_a_size_nobody_knows_and_not_a_failed_listing() {
+    let Some(dsn) = dsn() else { return };
+    let name = "consolebucketthree";
+    seed_bucket(&dsn, name, 0).await;
+    let pool = Pool::new(&dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    // Metadata is whatever wrote the row, and a row somebody made by
+    // hand or an upload that never finished can carry anything at all
+    // where the size goes. The listing has to survive that: a cast
+    // that raised here would take the whole bucket down with it.
+    for (file, metadata) in [
+        ("a-missing.png", "{}"),
+        ("b-nonsense.png", r#"{"size": "big"}"#),
+        ("c-fine.png", r#"{"size": 17}"#),
+    ] {
+        sess.execute(
+            // Through text on the way in, so the driver takes the
+            // metadata as the string it is here rather than asking for
+            // a json value the test does not otherwise need.
+            "insert into storage.objects (bucket_id, name, metadata)
+             values ($1, $2, $3::text::jsonb)",
+            &[&name, &file, &metadata],
+        )
+        .await
+        .expect("insert an object");
+    }
+    sess.commit().await.expect("park");
+
+    let body = fetched(
+        &app(&dsn),
+        &format!("/_zou/api/objects?bucket={name}&q=&page=0"),
+    )
+    .await;
+    let objects = body["objects"].as_array().expect("objects");
+    assert_eq!(objects.len(), 3);
+    assert_eq!(objects[0]["size"], serde_json::Value::Null);
+    assert_eq!(objects[1]["size"], serde_json::Value::Null);
+    assert_eq!(objects[2]["size"], 17);
+
+    forget_bucket(&dsn, name).await;
+}
+
+#[tokio::test]
+async fn a_bucket_deeper_than_a_page_says_there_is_another_one() {
+    let Some(dsn) = dsn() else { return };
+    let name = "consolebucketfour";
+    seed_bucket(&dsn, name, 51).await;
+    let app = app(&dsn);
+
+    let first = fetched(&app, &format!("/_zou/api/objects?bucket={name}&q=&page=0")).await;
+    assert_eq!(first["objects"].as_array().expect("objects").len(), 50);
+    assert_eq!(first["more"], true);
+    let second = fetched(&app, &format!("/_zou/api/objects?bucket={name}&q=&page=1")).await;
+    assert_eq!(second["objects"].as_array().expect("objects").len(), 1);
+    assert_eq!(second["more"], false);
+    assert_eq!(second["page"], 1);
+    assert_eq!(second["objects"][0]["name"], "folder/file-050.png");
+
+    forget_bucket(&dsn, name).await;
+}
+
+#[tokio::test]
+async fn listing_objects_without_saying_which_bucket_is_a_bad_request() {
+    let Some(dsn) = dsn() else { return };
+    let req = Request::builder()
+        .uri("/_zou/api/objects?q=x&page=0")
+        .header("authorization", format!("Bearer {}", service_key()))
+        .body(Body::empty())
+        .unwrap();
+    let res = app(&dsn).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn more_sql_than_the_console_will_run_is_refused_rather_than_read() {
     let Some(dsn) = dsn() else { return };

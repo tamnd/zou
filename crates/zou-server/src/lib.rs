@@ -1286,6 +1286,8 @@ pub fn routed(cfg: Config) -> Result<(Router, Arc<App>), String> {
         .route("/_zou/", get(console::page))
         .route("/_zou/api/catalog", get(console::catalog))
         .route("/_zou/api/users", get(console::users))
+        .route("/_zou/api/buckets", get(console::buckets))
+        .route("/_zou/api/objects", get(console::objects))
         .route("/_zou/api/sql", post(console::run))
         .route("/storage/v1/s3", get(s3::list_buckets))
         .route("/storage/v1/s3/", get(s3::list_buckets))
@@ -1989,10 +1991,11 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
 
-        // The user list is behind the same fence as the editor, and for
-        // a sharper reason: it is a list of everybody's email address.
-        let list = |auth: Option<String>| async move {
-            let mut req = Request::builder().uri("/_zou/api/users?q=a&page=0");
+        // The lists are behind the same fence as the editor, and for a
+        // sharper reason: one of them is everybody's email address and
+        // the others are the name of every file the project holds.
+        let list = |path: &'static str, auth: Option<String>| async move {
+            let mut req = Request::builder().uri(path);
             if let Some(auth) = auth {
                 req = req.header(header::AUTHORIZATION, format!("Bearer {auth}"));
             }
@@ -2002,9 +2005,23 @@ mod tests {
                 .unwrap()
                 .status()
         };
-        assert_eq!(list(None).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(list(Some(anon_key())).await, StatusCode::FORBIDDEN);
-        assert_eq!(list(Some(service)).await, StatusCode::SERVICE_UNAVAILABLE);
+        for path in [
+            "/_zou/api/users?q=a&page=0",
+            "/_zou/api/buckets",
+            "/_zou/api/objects?bucket=avatars",
+        ] {
+            assert_eq!(list(path, None).await, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(
+                list(path, Some(anon_key())).await,
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+            assert_eq!(
+                list(path, Some(service.clone())).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
