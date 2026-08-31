@@ -110,10 +110,13 @@ impl Doors {
             });
         }
         if let Some(listener) = self.ops {
+            // The same set the front door serves out of, so the tenants
+            // page lists what is actually up rather than a copy of it.
+            let ops_set = Arc::clone(&self.attached);
             tokio::spawn(async move {
                 let served = axum::serve(
                     convert(listener)?,
-                    crate::ops::ops(version).into_make_service(),
+                    crate::ops::ops(version, Some(ops_set)).into_make_service(),
                 )
                 .await;
                 if let Err(e) = served {
