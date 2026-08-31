@@ -1,14 +1,22 @@
 //! The port an operator points a scraper at.
 //!
-//! Two routes, `/healthz` and `/metrics`, on a listener of their own.
-//! Their own listener and not the front door's, for two reasons that
-//! both come from what the front door is. Under path routing the first
-//! segment of every url is a tenant ref, with nothing reserved, so a
-//! `/metrics` route there would quietly take a name a project could
-//! have had. And a scrape is the operational state of the node, which
-//! is not something to hand to whoever holds an anon key for one of the
-//! projects on it. A second listener is the cheap answer to both, and
-//! it is the one every deployment already knows how to firewall.
+//! `/healthz` and `/metrics` for a scraper, and `/_zou` for a person,
+//! on a listener of their own. Their own listener and not the front
+//! door's, for two reasons that both come from what the front door is.
+//! Under path routing the first segment of every url is a tenant ref,
+//! with nothing reserved, so a `/metrics` route there would quietly take
+//! a name a project could have had. And a scrape is the operational
+//! state of the node, which is not something to hand to whoever holds an
+//! anon key for one of the projects on it. A second listener is the
+//! cheap answer to both, and it is the one every deployment already
+//! knows how to firewall.
+//!
+//! The page is here for the second of those reasons rather than the
+//! first. Which projects a node has up is a fact about the node, and the
+//! only credential the front door could check it against is one
+//! project's service key, which has no business answering questions
+//! about the other projects on the box. So the list of tenants is on the
+//! operator's port, where the rest of what an operator asks already is.
 //!
 //! What is instrumented lives where it happens: the attach manager
 //! counts attaches, the tenant registry counts lookups, the request
@@ -27,6 +35,7 @@
 //! twice would mean counting the ones this process can see and missing
 //! the rest.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -46,7 +55,16 @@ const EXPOSITION: &str = "text/plain; version=0.0.4; charset=utf-8";
 /// The ops router. `version` is what the build reports about itself,
 /// which is the one thing a scrape carries that the process cannot
 /// count.
-pub fn ops(version: &'static str) -> Router {
+///
+/// `attached` is the node's attached set, when the process has one. It
+/// is what `/_zou` lists, and the reason the list is on this port rather
+/// than on the front door is the same reason `/metrics` is: which
+/// projects a node is serving is a fact about the node, and the only key
+/// the front door could check it against is one project's service key,
+/// which has no business answering questions about the others. None is a
+/// process with one project and no set to list, which is what `zou dev`
+/// is.
+pub fn ops(version: &'static str, attached: Option<Arc<crate::attach::Attached>>) -> Router {
     // A gauge that is always one, which is the standard way to get a
     // build's version into a query: join on it and every series can be
     // grouped by the version that produced it.
@@ -60,7 +78,89 @@ pub fn ops(version: &'static str) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
+        .route("/_zou", get(tenants_page))
+        .route("/_zou/", get(tenants_page))
+        .route("/_zou/api/tenants", get(tenants))
         .fallback(missing)
+        .with_state(attached)
+}
+
+/// The tenants page, which is the whole web admin this port serves.
+///
+/// Compiled in, no data in it, the same bytes on every node, for the
+/// reasons the project console is the same: an operator who can reach
+/// the port can read the page, on a box with no internet and nothing
+/// installed beside the binary.
+const TENANTS: &str = include_str!("tenants.html");
+
+async fn tenants_page() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        TENANTS,
+    )
+        .into_response()
+}
+
+/// GET /_zou/api/tenants, which projects this node has up.
+///
+/// Up, and not every project on the store. A node attaches a project
+/// when something asks for it and lets it go when nothing has for a
+/// while, so this is the working set and not an inventory. The
+/// inventory lives in the store and reading it is a listing, which is
+/// not a thing to do behind a page that refreshes.
+///
+/// Both budgets are in the answer beside the list, because a list of
+/// nine hundred tenants means one thing under a ceiling of a thousand
+/// and another under a ceiling of nine hundred.
+async fn tenants(
+    axum::extract::State(attached): axum::extract::State<Option<Arc<crate::attach::Attached>>>,
+) -> Response {
+    let Some(attached) = attached else {
+        // Not an error and not an empty list either. A process with one
+        // project has no set to list and saying so is the difference
+        // between a node with nothing up and a node that does not work
+        // this way at all.
+        return json(
+            StatusCode::OK,
+            serde_json::json!({ "tenants": [], "fleet": false }),
+        );
+    };
+    let listed: Vec<serde_json::Value> = attached
+        .listing()
+        .await
+        .into_iter()
+        .map(|one| {
+            serde_json::json!({
+                "ref": one.tenant_ref,
+                "up_for": one.up_for.as_secs(),
+                "idle_for": one.idle_for.as_secs(),
+                "in_use": one.in_use,
+                "ready": one.ready,
+            })
+        })
+        .collect();
+    json(
+        StatusCode::OK,
+        serde_json::json!({
+            "tenants": listed,
+            "fleet": true,
+            "ceiling": attached.ceiling(),
+            "idle_after": attached.idle_after().as_secs(),
+        }),
+    )
+}
+
+fn json(status: StatusCode, body: serde_json::Value) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// Alive, which is all this answers.
@@ -712,6 +812,10 @@ pub fn lookup(hit: bool) {
 /// seconds and nothing else, and because the reason it is a separate
 /// listener is so that it stays answerable when the front door is
 /// busy.
+///
+/// No attached set, because this is the door a one project process opens
+/// and a one project process has none: the tenants page says so rather
+/// than showing an empty node.
 pub fn serve_blocking(
     listener: std::net::TcpListener,
     version: &'static str,
@@ -727,7 +831,7 @@ pub fn serve_blocking(
             .map_err(|e| format!("nonblocking: {e}"))?;
         let listener =
             tokio::net::TcpListener::from_std(listener).map_err(|e| format!("listener: {e}"))?;
-        axum::serve(listener, ops(version).into_make_service())
+        axum::serve(listener, ops(version, None).into_make_service())
             .await
             .map_err(|e| format!("serve: {e}"))
     })
@@ -763,9 +867,75 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_answers_without_touching_anything() {
-        let (status, _, body) = call(&ops("0.0.0-test"), "/healthz").await;
+        let (status, _, body) = call(&ops("0.0.0-test", None), "/healthz").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok\n");
+    }
+
+    #[tokio::test]
+    async fn the_tenants_page_is_markup_and_holds_no_node_in_it() {
+        let (status, kind, body) = call(&ops("0.0.0-test", None), "/_zou").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kind, "text/html; charset=utf-8");
+        assert!(body.starts_with("<!doctype html>"), "{body}");
+        // The same bytes on every node. Everything it shows arrives
+        // through the endpoint below and nothing is baked into it.
+        assert!(body.contains("/_zou/api/tenants"), "{body}");
+    }
+
+    /// A process with one project is not a node with nothing up, and the
+    /// answer has to say which of the two it is.
+    #[tokio::test]
+    async fn a_process_with_no_attached_set_says_so_rather_than_listing_none() {
+        let (status, kind, body) = call(&ops("0.0.0-test", None), "/_zou/api/tenants").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kind, "application/json");
+        let answer: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(answer["fleet"], false);
+        assert_eq!(answer["tenants"].as_array().expect("a list").len(), 0);
+        assert!(answer["ceiling"].is_null(), "no set, no budget: {body}");
+    }
+
+    /// A node with projects on it, listed the way an operator reads it.
+    #[tokio::test]
+    async fn a_node_lists_the_projects_it_has_up_with_the_budgets_they_are_under() {
+        /// Attaches nothing. The list is about the map, not about what
+        /// is behind it, so a backend that starts no postmaster is the
+        /// right one to ask the question through.
+        struct Nothing;
+        impl crate::attach::Backend for Nothing {
+            fn up(&self, entry: &zou_store::registry::Tenant) -> Result<crate::Config, String> {
+                Ok(crate::Config {
+                    jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
+                    ..crate::Config::default()
+                })
+            }
+            fn down(&self, _tenant_ref: &str) {}
+        }
+        let attached = Arc::new(crate::attach::Attached::new(Arc::new(Nothing)));
+        for name in ["beta", "alpha"] {
+            let entry = zou_store::registry::Tenant::new(
+                name,
+                "super-secret-jwt-token-with-at-least-32-characters-long",
+                1,
+            );
+            let _ = attached.router(&entry).await.expect("attach");
+        }
+        let router = ops("0.0.0-test", Some(Arc::clone(&attached)));
+        let (status, _, body) = call(&router, "/_zou/api/tenants").await;
+        assert_eq!(status, StatusCode::OK);
+        let answer: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(answer["fleet"], true);
+        assert_eq!(answer["ceiling"], crate::attach::MAX_ATTACHED);
+        assert_eq!(answer["idle_after"], crate::attach::IDLE.as_secs());
+        let listed = answer["tenants"].as_array().expect("a list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["ref"], "alpha", "by name: {body}");
+        assert_eq!(listed[1]["ref"], "beta");
+        // Nothing is holding either of them: the request that attached
+        // them let go on its way out.
+        assert_eq!(listed[0]["in_use"], 0);
+        assert_eq!(listed[0]["ready"], true);
     }
 
     #[tokio::test]
@@ -775,7 +945,7 @@ mod tests {
         // carries, not what they are counting at the moment.
         attached(3);
         lookup(true);
-        let (status, kind, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        let (status, kind, body) = call(&ops("0.0.0-test", None), "/metrics").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(kind, EXPOSITION);
         assert!(
@@ -804,7 +974,7 @@ mod tests {
         // A commit timestamp from a database whose clock is ahead of
         // this one, which is an hour that must not land in the sum.
         change_delivered(now + 3_600_000_000, Instant::now());
-        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        let (_, _, body) = call(&ops("0.0.0-test", None), "/metrics").await;
         assert!(body.contains("zou_realtime_changes_total 2\n"), "{body}");
         assert!(
             body.contains("# TYPE zou_realtime_commit_to_socket_seconds histogram\n"),
@@ -862,7 +1032,7 @@ mod tests {
         change_stage("select", Duration::from_millis(30));
         change_stage("send", Duration::from_millis(6));
         change_stage("socket", Duration::from_millis(11));
-        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        let (_, _, body) = call(&ops("0.0.0-test", None), "/metrics").await;
         assert!(
             body.contains("# TYPE zou_realtime_stage_seconds histogram\n"),
             "{body}"
@@ -891,7 +1061,7 @@ mod tests {
     async fn the_sockets_a_node_holds_go_down_again() {
         socket_joined();
         socket_joined();
-        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        let (_, _, body) = call(&ops("0.0.0-test", None), "/metrics").await;
         let held = |body: &str| {
             body.lines()
                 .find_map(|line| line.strip_prefix("zou_realtime_sockets "))
@@ -902,10 +1072,10 @@ mod tests {
         assert!(two >= 2, "both of them are in it, {two}");
         socket_left();
         socket_left();
-        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        let (_, _, body) = call(&ops("0.0.0-test", None), "/metrics").await;
         assert_eq!(held(&body), two - 2, "and both of them are out of it again");
         subscribers(7);
-        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        let (_, _, body) = call(&ops("0.0.0-test", None), "/metrics").await;
         // The number is not asked for. This gauge is a process global
         // and the reader's own tests set it whenever one of them
         // registers a subscription, so a run that happens to interleave
@@ -923,7 +1093,7 @@ mod tests {
     async fn the_ops_port_has_nothing_else_on_it() {
         // Whatever else is asked for here is not a tenant's url. This
         // listener serves an operator and nobody else.
-        let (status, _, _) = call(&ops("0.0.0-test"), "/rest/v1/todos").await;
+        let (status, _, _) = call(&ops("0.0.0-test", None), "/rest/v1/todos").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

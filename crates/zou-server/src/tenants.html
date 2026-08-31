@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>zou node</title>
+<style>
+:root {
+  --bg: #101418; --panel: #161c22; --line: #232c35; --text: #d7dee6;
+  --dim: #7d8b99; --accent: #4fb3a5; --bad: #e0674f; --font: ui-monospace,
+  SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; height: 100vh; display: flex; flex-direction: column;
+  background: var(--bg); color: var(--text); font: 13px/1.5 var(--font);
+}
+header {
+  display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header b { color: var(--accent); font-weight: 600; }
+header span { flex: 1; color: var(--dim); }
+button {
+  padding: 5px 12px; background: var(--line); color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px; font: inherit;
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+label { color: var(--dim); }
+#out { flex: 1; overflow: auto; padding: 0 0 40px; }
+table { border-collapse: collapse; width: 100%; }
+th, td {
+  padding: 3px 10px; text-align: left; border-bottom: 1px solid var(--line);
+  white-space: pre; max-width: 460px; overflow: hidden;
+  text-overflow: ellipsis;
+}
+th {
+  position: sticky; top: 0; background: var(--panel); color: var(--dim);
+  font-weight: 600;
+}
+td.dim { color: var(--dim); }
+td.warn { color: var(--bad); }
+p.tag { margin: 8px 12px; color: var(--dim); }
+pre.bad {
+  margin: 12px; padding: 10px 12px; border-left: 3px solid var(--bad);
+  background: var(--panel); color: var(--bad); white-space: pre-wrap;
+}
+</style>
+</head>
+<body>
+<header>
+  <b>zou</b>
+  <span id="note"></span>
+  <label><input id="live" type="checkbox"> every 5s</label>
+  <button id="again">read</button>
+</header>
+<div id="out"></div>
+<script>
+"use strict";
+var out = document.getElementById("out");
+var note = document.getElementById("note");
+var live = document.getElementById("live");
+var timer = null;
+
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+function el(name, text, cls) {
+  var n = document.createElement(name);
+  if (text !== undefined && text !== null) n.textContent = text;
+  if (cls) n.className = cls;
+  return n;
+}
+
+// Seconds into something a person reads at a glance. An operator
+// looking at this wants to know whether a tenant came up a moment ago
+// or yesterday, and 93841 is not an answer to that.
+function ago(s) {
+  if (s === null || s === undefined) return "";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+}
+
+function read() {
+  fetch("/_zou/api/tenants", { headers: { "accept": "application/json" } })
+    .then(function (r) { return r.json(); })
+    .then(draw, function (e) {
+      clear(out);
+      out.appendChild(el("pre", String(e), "bad"));
+    });
+}
+
+function draw(body) {
+  clear(out);
+  if (!body.fleet) {
+    note.textContent = "";
+    out.appendChild(el("p", "This process serves one project and keeps no "
+      + "set of attached tenants, so there is nothing to list here. The "
+      + "project's own console is on the front door at /_zou.", "tag"));
+    return;
+  }
+  var list = body.tenants;
+  note.textContent = list.length + " of " + body.ceiling + " up, let go after "
+    + ago(body.idle_after) + " idle";
+  if (!list.length) {
+    // Nothing up is the ordinary state of a node nobody has asked
+    // anything of yet, not a fault, and it should not read like one.
+    out.appendChild(el("p", "Nothing is attached. A project comes up when "
+      + "something asks for it.", "tag"));
+    return;
+  }
+  var head = el("tr");
+  ["project", "state", "in use", "up for", "idle for"]
+    .forEach(function (name) { head.appendChild(el("th", name)); });
+  var table = el("table");
+  table.appendChild(head);
+  list.forEach(function (t) {
+    var tr = el("tr");
+    tr.appendChild(el("td", t.ref));
+    // Not ready is either an attach happening right now or one that
+    // failed and left the slot for the next request to try again, and
+    // both are worth seeing.
+    tr.appendChild(el("td", t.ready ? "up" : "attaching",
+      t.ready ? "dim" : "warn"));
+    tr.appendChild(el("td", t.in_use ? String(t.in_use) : "",
+      t.in_use ? "" : "dim"));
+    tr.appendChild(el("td", ago(t.up_for), "dim"));
+    // The one number the idle budget is measured against, so it is the
+    // one that says which of these the next sweep will take.
+    tr.appendChild(el("td", ago(t.idle_for),
+      t.idle_for >= body.idle_after ? "warn" : ""));
+    table.appendChild(tr);
+  });
+  out.appendChild(table);
+}
+
+document.getElementById("again").onclick = read;
+// Off by default. A page that polls on its own is a page somebody
+// leaves open on a second monitor for a week, and every read of it
+// takes the lock every attach on this node takes.
+live.onchange = function () {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (live.checked) timer = setInterval(read, 5000);
+};
+read();
+</script>
+</body>
+</html>

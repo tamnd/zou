@@ -79,7 +79,7 @@ async fn serve(router: axum::Router) -> SocketAddr {
 /// which is the number an operator watches and the only one from out
 /// here that says whether a tier is still there.
 async fn tiers() -> u64 {
-    let answer = zou_server::ops::ops("0.0.0-test")
+    let answer = zou_server::ops::ops("0.0.0-test", None)
         .oneshot(
             axum::http::Request::builder()
                 .uri("/metrics")

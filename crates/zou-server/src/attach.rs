@@ -92,6 +92,10 @@ struct Slot {
     /// Built once. A failed attach leaves this empty, so the next
     /// request tries again rather than inheriting the failure.
     up: OnceCell<Arc<Up>>,
+    /// When this slot was made, on the same clock `used` is on. Written
+    /// once and read only by an operator asking what is up, so it is the
+    /// one field here that nothing on the request path touches.
+    since: u64,
     /// Milliseconds since the manager was made, so that touching a
     /// tenant on the read path is one relaxed store and not a lock.
     used: AtomicU64,
@@ -176,6 +180,29 @@ impl Drop for Busy {
     fn drop(&mut self) {
         self.0.busy.fetch_sub(1, Ordering::Release);
     }
+}
+
+/// One attached tenant, as an operator sees it.
+///
+/// Two ages rather than one, because they answer different questions. A
+/// tenant that has been up an hour and idle for fourteen minutes is one
+/// the next sweep will take, and a tenant that has been up ten seconds
+/// and idle for ten seconds is one that was attached and then abandoned,
+/// which is what a health check pointed at the wrong host looks like.
+pub struct Listed {
+    pub tenant_ref: String,
+    /// Since this slot was made, which is since the tenant came up.
+    pub up_for: Duration,
+    /// Since anything last asked for it. The idle budget is measured
+    /// against exactly this.
+    pub idle_for: Duration,
+    /// How many callers are inside it right now. Not zero and neither
+    /// budget will take it.
+    pub in_use: usize,
+    /// Whether the attach behind it finished. False is a tenant being
+    /// built right now, or one whose last attach failed and which the
+    /// next request for it will try again.
+    pub ready: bool,
 }
 
 /// The attached set.
@@ -384,13 +411,56 @@ impl Attached {
         self.len().await == 0
     }
 
+    /// What is up, for an operator asking rather than for the node
+    /// deciding anything.
+    ///
+    /// Nothing on the request path reads this and nothing here changes
+    /// what the node does. It takes the map lock for as long as it takes
+    /// to copy the names, which is the same lock every attach takes, so
+    /// it is a page somebody opens and not a thing to poll every second
+    /// on a node with a thousand projects on it.
+    ///
+    /// Sorted by name, because a list an operator reads twice should be
+    /// in the same order both times, and the map's own order is a hash
+    /// order that changes when anything is inserted.
+    pub async fn listing(&self) -> Vec<Listed> {
+        let now = self.now();
+        let slots = self.slots.lock().await;
+        let mut listed: Vec<Listed> = slots
+            .iter()
+            .map(|(tenant_ref, slot)| Listed {
+                tenant_ref: tenant_ref.clone(),
+                up_for: Duration::from_nanos(now.saturating_sub(slot.since)),
+                idle_for: Duration::from_nanos(
+                    now.saturating_sub(slot.used.load(Ordering::Relaxed)),
+                ),
+                in_use: slot.busy.load(Ordering::Relaxed),
+                ready: slot.up.initialized(),
+            })
+            .collect();
+        listed.sort_unstable_by(|a, b| a.tenant_ref.cmp(&b.tenant_ref));
+        listed
+    }
+
+    /// The ceiling this node evicts down to.
+    pub fn ceiling(&self) -> usize {
+        self.max
+    }
+
+    /// How long a tenant nobody asks for is kept.
+    pub fn idle_after(&self) -> Duration {
+        self.idle
+    }
+
     async fn slot(&self, tenant_ref: &str) -> Arc<Slot> {
+        let since = self.now();
         let mut slots = self.slots.lock().await;
         slots
             .entry(tenant_ref.to_string())
             .or_insert_with(|| {
                 Arc::new(Slot {
                     up: OnceCell::new(),
+                    since,
                     used: AtomicU64::new(0),
                     busy: AtomicUsize::new(0),
                     deployed: AtomicU64::new(0),
@@ -540,6 +610,39 @@ mod tests {
         }
         assert_eq!(fake.ups(), vec!["acme-prod"], "one attach, five requests");
         assert_eq!(attached.len().await, 1);
+    }
+
+    /// What an operator asking the node what it is doing gets back.
+    #[tokio::test(start_paused = true)]
+    async fn what_is_up_is_listed_by_name_with_both_of_its_ages() {
+        let (_fake, attached) = manager();
+        let _ = attached.router(&entry("zeta")).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let held = attached.hold(&entry("alpha")).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let listed = attached.listing().await;
+        let names: Vec<&str> = listed.iter().map(|one| one.tenant_ref.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"], "by name, not by hash order");
+
+        let alpha = &listed[0];
+        assert!(alpha.ready, "the attach finished");
+        assert_eq!(alpha.in_use, 1, "the hold is still alive");
+        assert_eq!(alpha.up_for.as_secs(), 10);
+        assert_eq!(alpha.idle_for.as_secs(), 10);
+
+        // Up for forty seconds and idle for all forty of them, which is
+        // the tenant the next sweep takes and the reason both ages are
+        // in the answer rather than one.
+        let zeta = &listed[1];
+        assert_eq!(zeta.in_use, 0, "nothing is inside it");
+        assert_eq!(zeta.up_for.as_secs(), 40);
+        assert_eq!(zeta.idle_for.as_secs(), 40);
+
+        drop(held);
+        assert_eq!(attached.listing().await[0].in_use, 0, "the hold is over");
+        assert_eq!(attached.ceiling(), MAX_ATTACHED);
+        assert_eq!(attached.idle_after(), IDLE);
     }
 
     /// A project nobody deployed to, which is the case that has to cost
