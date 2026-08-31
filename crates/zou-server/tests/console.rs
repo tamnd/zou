@@ -590,6 +590,106 @@ async fn a_bucket_deeper_than_a_page_says_there_is_another_one() {
     forget_bucket(&dsn, name).await;
 }
 
+/// Write audit entries the way the auth surface writes them, one per
+/// action, all naming the same actor.
+async fn seed_audit(dsn: &str, who: &str, actions: &[(&str, &str)]) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    sess.execute(
+        "delete from auth.audit_log_entries
+          where payload->>'actor_username' = $1",
+        &[&who],
+    )
+    .await
+    .expect("clear the trail");
+    for (n, (action, kind)) in actions.iter().enumerate() {
+        sess.execute(
+            "insert into auth.audit_log_entries (instance_id, id, payload,
+                                                 created_at, ip_address)
+             values ('00000000-0000-0000-0000-000000000000', gen_random_uuid(),
+                     json_build_object('actor_id', gen_random_uuid()::text,
+                                       'actor_username', $1::text,
+                                       'actor_via_sso', false,
+                                       'action', $2::text,
+                                       'log_type', $3::text,
+                                       'traits', json_build_object('provider', 'email')),
+                     now() - make_interval(secs => $4::int), '10.0.0.7')",
+            &[&who, action, kind, &(n as i32)],
+        )
+        .await
+        .expect("insert an entry");
+    }
+    sess.commit().await.expect("park");
+}
+
+async fn forget_audit(dsn: &str, who: &str) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    sess.execute(
+        "delete from auth.audit_log_entries
+          where payload->>'actor_username' = $1",
+        &[&who],
+    )
+    .await
+    .expect("delete");
+    sess.commit().await.expect("park");
+}
+
+#[tokio::test]
+async fn the_audit_trail_says_who_did_what_from_where_newest_first() {
+    let Some(dsn) = dsn() else { return };
+    let who = "consoletrail@example.test";
+    seed_audit(
+        &dsn,
+        who,
+        &[
+            ("login", "account"),
+            ("logout", "account"),
+            ("token_refreshed", "token"),
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    let body = fetched(
+        &app,
+        &format!("/_zou/api/audit?q={}&page=0", who.replace('@', "%40")),
+    )
+    .await;
+    let entries = body["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 3);
+    // The seed put each entry a second further back than the one
+    // before, so the first written is the newest and comes first.
+    assert_eq!(entries[0]["action"], "login");
+    assert_eq!(entries[0]["kind"], "account");
+    assert_eq!(entries[0]["actor"], who);
+    assert_eq!(entries[0]["ip"], "10.0.0.7");
+    assert_eq!(entries[2]["action"], "token_refreshed");
+    // The traits come back whole, because what a flow thought was worth
+    // recording is not something this end can summarise.
+    assert!(
+        entries[0]["traits"]
+            .as_str()
+            .expect("traits")
+            .contains("email")
+    );
+    // Nothing has switched the postgres copy off, so an empty page
+    // would have meant a quiet project rather than a silent one.
+    assert_eq!(body["writing"], true);
+    assert_eq!(body["more"], false);
+
+    // The search reaches the action as well as the actor, which is how
+    // somebody asks what has been signing in.
+    let logins = fetched(&app, "/_zou/api/audit?q=token_refreshed&page=0").await;
+    let found = logins["entries"].as_array().expect("entries");
+    assert!(!found.is_empty());
+    for entry in found {
+        assert_eq!(entry["action"], "token_refreshed");
+    }
+
+    forget_audit(&dsn, who).await;
+}
+
 #[tokio::test]
 async fn listing_objects_without_saying_which_bucket_is_a_bad_request() {
     let Some(dsn) = dsn() else { return };

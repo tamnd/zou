@@ -242,6 +242,11 @@ function draw(schemas) {
   files.appendChild(document.createTextNode("storage"));
   files.onclick = function () { term = ""; page = 0; buckets(); };
   tree.appendChild(files);
+  var trail = el("button");
+  trail.type = "button";
+  trail.appendChild(document.createTextNode("audit"));
+  trail.onclick = function () { term = ""; page = 0; audit(); };
+  tree.appendChild(trail);
   schemas.forEach(function (schema) {
     tree.appendChild(el("h2", schema.name));
     schema.relations.forEach(function (relation) {
@@ -459,6 +464,66 @@ function objects(id) {
         out.appendChild(table);
       }
       pager(answer.body.more, function () { objects(id); });
+      find.focus();
+    }, function (e) { complain(String(e)); });
+}
+
+// The audit trail: who did what, from where, and when.
+function audit() {
+  listing();
+  var find = el("input");
+  find.type = "search";
+  find.spellcheck = false;
+  find.placeholder = "action, actor or address";
+  find.value = term;
+  find.onkeydown = function (e) {
+    if (e.key === "Enter") { term = find.value.trim(); page = 0; audit(); }
+  };
+  bar.insertBefore(find, note);
+  note.textContent = "reading the audit trail";
+  ask("/_zou/api/audit?q=" + encodeURIComponent(term) + "&page=" + page)
+    .then(function (answer) {
+      note.textContent = "";
+      if (answer.status !== 200) {
+        complain(answer.body.error || ("HTTP " + answer.status));
+        return;
+      }
+      clear(out);
+      if (answer.body.absent) {
+        out.appendChild(el("p", "This project has no auth schema on it, "
+          + "so there is no trail to read.", "tag"));
+        return;
+      }
+      var list = answer.body.entries;
+      note.textContent = list.length + " on page " + (page + 1);
+      if (!list.length) {
+        // An empty trail on a project that is not writing one is not
+        // a quiet project, and saying so is the difference between
+        // reading nothing and reading nothing into it.
+        out.appendChild(el("p", answer.body.writing
+          ? (term ? "Nothing matches that." : "Nothing has been recorded yet.")
+          : "This project does not write its audit trail to postgres, so "
+            + "the entries are on the log stream and not in this table.",
+          "tag"));
+      } else {
+        var head = el("tr");
+        ["when", "action", "kind", "actor", "address", "traits"]
+          .forEach(function (name) { head.appendChild(el("th", name)); });
+        var table = el("table");
+        table.appendChild(head);
+        list.forEach(function (entry) {
+          var tr = el("tr");
+          tr.appendChild(el("td", entry.at || ""));
+          tr.appendChild(el("td", entry.action || ""));
+          tr.appendChild(el("td", entry.kind || "", "dim"));
+          tr.appendChild(el("td", entry.actor || "", entry.actor ? "" : "dim"));
+          tr.appendChild(el("td", entry.ip || "", entry.ip ? "" : "dim"));
+          tr.appendChild(el("td", entry.traits || "", "dim"));
+          table.appendChild(tr);
+        });
+        out.appendChild(table);
+      }
+      pager(answer.body.more, audit);
       find.focus();
     }, function (e) { complain(String(e)); });
 }

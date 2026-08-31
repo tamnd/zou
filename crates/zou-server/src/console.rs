@@ -1,6 +1,6 @@
 //! The web admin at `/_zou`.
 //!
-//! One page and five endpoints, served by the same binary that serves
+//! One page and six endpoints, served by the same binary that serves
 //! the project. There is no build step, no bundler and nothing fetched
 //! from a CDN: the page is a single file compiled into the binary, so
 //! an operator who can reach the server can reach the console, on a box
@@ -178,6 +178,38 @@ select o.id::text as id,
    and ($2::text = '' or o.name ilike $3::text)
  order by o.name
  limit $4::bigint offset $5::bigint";
+
+/// One page of the audit trail, newest first.
+///
+/// The payload is a json object with the actor and the event in it
+/// rather than columns, because that is the shape GoTrue writes and the
+/// console reads what is there rather than a shape of its own. What it
+/// does do is lift the four fields somebody scans a log for into their
+/// own keys, and hand the traits back whole underneath: an entry's
+/// traits are whatever the flow that wrote it thought were worth
+/// keeping, so there is nothing general to say about them beyond
+/// showing them.
+///
+/// Sorted rather than read in order, because the only index upstream
+/// puts on this table is on the instance id and this schema is theirs.
+/// The sweep that deletes entries older than the project's retention is
+/// what keeps that sort honest.
+const AUDIT: &str = "\
+select l.id::text as id,
+       date_trunc('second', l.created_at)::text as at,
+       l.payload->>'action' as action,
+       l.payload->>'log_type' as kind,
+       coalesce(nullif(l.payload->>'actor_username', ''),
+                l.payload->>'actor_id') as actor,
+       nullif(l.ip_address, '') as ip,
+       nullif((l.payload->'traits')::text, 'null') as traits
+  from auth.audit_log_entries l
+ where $1::text = ''
+    or l.payload->>'action' ilike $2::text
+    or l.payload->>'actor_username' ilike $2::text
+    or l.ip_address ilike $2::text
+ order by l.created_at desc nulls last, l.id
+ limit $3::bigint offset $4::bigint";
 
 /// What the console will not run in one request, in bytes. Large
 /// enough for a migration somebody pasted in, small enough that a
@@ -628,6 +660,93 @@ pub async fn objects(
     )
 }
 
+/// GET /_zou/api/audit, what the project's people have been doing.
+///
+/// The log a project keeps about itself. Every sign in, sign out,
+/// signup, token refresh and admin action lands in this table with the
+/// address it came from, which makes it the first thing worth reading
+/// when an account has done something nobody expected, and the only
+/// record of it once the process that served the request is gone.
+///
+/// The answer says whether the trail is being written at all, because
+/// an empty list means two very different things: a project where
+/// nothing has happened yet, and a project that has switched the
+/// postgres copy off and is writing only to its log stream. A page that
+/// could not tell them apart would report the second as silence.
+pub async fn audit(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let pool = match admitted(&app, &req) {
+        Ok(pool) => pool,
+        Err(res) => return *res,
+    };
+    let writing = !app.cfg.audit.disable_postgres;
+    let query = crate::auth::query_object(req.uri().query().unwrap_or_default());
+    let Asked { term, like, page } = asked(&query);
+    let sess = match pool.unscoped().await {
+        Ok(sess) => sess,
+        Err(e) => return refused(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    match present(&sess, "auth.audit_log_entries").await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = sess.commit().await;
+            return json_body(
+                StatusCode::OK,
+                serde_json::json!({
+                    "entries": [], "more": false, "absent": true, "writing": writing,
+                }),
+            );
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    }
+    let rows = match sess
+        .query(
+            AUDIT,
+            &[&term, &like, &(LIST_PAGE + 1), &(page * LIST_PAGE)],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
+    if let Err(e) = sess.commit().await {
+        return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+    }
+    let more = rows.len() as i64 > LIST_PAGE;
+    let listed: Vec<serde_json::Value> = rows
+        .iter()
+        .take(LIST_PAGE as usize)
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<_, String>("id"),
+                "at": row.get::<_, Option<String>>("at"),
+                "action": row.get::<_, Option<String>>("action"),
+                "kind": row.get::<_, Option<String>>("kind"),
+                "actor": row.get::<_, Option<String>>("actor"),
+                "ip": row.get::<_, Option<String>>("ip"),
+                "traits": row.get::<_, Option<String>>("traits"),
+            })
+        })
+        .collect();
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({
+            "entries": listed,
+            "page": page,
+            "more": more,
+            "writing": writing,
+        }),
+    )
+}
+
 /// POST /_zou/api/sql, run what the editor holds.
 ///
 /// The simple protocol, so a person can paste several statements and
@@ -794,6 +913,7 @@ mod tests {
         assert!(PAGE.contains("/_zou/api/users?q="));
         assert!(PAGE.contains("/_zou/api/buckets"));
         assert!(PAGE.contains("/_zou/api/objects?bucket="));
+        assert!(PAGE.contains("/_zou/api/audit?q="));
     }
 
     #[test]
