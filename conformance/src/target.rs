@@ -101,16 +101,25 @@ pub struct Target {
 /// header is what turns a resize that happened to come out the right
 /// size into a resize that was asked for the right way. storage-js has
 /// a test that reads it, which is how it was noticed at all.
-pub const COMPARED: [&str; 19] = [
+///
+/// `link` and `x-total-count` are the admin listings' pagination, and
+/// they are the whole of it: the body is the page, and how many rows
+/// there are and where the next page and the last page live are only in
+/// the headers. A client that pages through accounts reads them and
+/// nothing else, so a listing compared on its body alone is a listing
+/// whose paging was never asked about.
+pub const COMPARED: [&str; 21] = [
     "allow",
     "content-profile",
     "content-range",
     "content-type",
     "etag",
+    "link",
     "location",
     "preference-applied",
     "retry-after",
     "www-authenticate",
+    "x-total-count",
     "x-transformations",
     "tus-extension",
     "tus-max-size",

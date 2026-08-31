@@ -848,11 +848,10 @@ async fn the_list_is_a_page_of_one_audience_newest_first() {
     );
     assert_eq!(all.header("x-total-count"), "3");
     // One page holds all three, so there is no next, and last is this
-    // page.
-    assert_eq!(
-        all.header("link"),
-        "</auth/v1/admin/users?page=1>; rel=\"last\""
-    );
+    // page. The link carries no /auth/v1 because upstream sits behind a
+    // gateway that took the prefix off before it saw the request, and a
+    // client following the link has to get what upstream's client gets.
+    assert_eq!(all.header("link"), "</admin/users?page=1>; rel=\"last\"");
 
     let ascending = listed(&app, &aud, "sort=created_at+asc").await;
     assert_eq!(
@@ -870,14 +869,14 @@ async fn the_list_is_a_page_of_one_audience_newest_first() {
     assert_eq!(first.header("x-total-count"), "3");
     assert_eq!(
         first.header("link"),
-        "</auth/v1/admin/users?page=2&per_page=2>; rel=\"next\", \
-         </auth/v1/admin/users?page=2&per_page=2>; rel=\"last\""
+        "</admin/users?page=2&per_page=2>; rel=\"next\", \
+         </admin/users?page=2&per_page=2>; rel=\"last\""
     );
     let second = listed(&app, &aud, "per_page=2&page=2").await;
     assert_eq!(second.emails(), vec![address("admin-list-alpha")]);
     assert_eq!(
         second.header("link"),
-        "</auth/v1/admin/users?page=2&per_page=2>; rel=\"last\"",
+        "</admin/users?page=2&per_page=2>; rel=\"last\"",
         "the last page does not point at a next one"
     );
 
