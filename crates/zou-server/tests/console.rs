@@ -690,6 +690,101 @@ async fn the_audit_trail_says_who_did_what_from_where_newest_first() {
     forget_audit(&dsn, who).await;
 }
 
+/// A table with enough in it to be one of the largest in the database,
+/// and an index on it, so the split between the two has something in
+/// both halves. Two hundred characters a row stays under the toast
+/// threshold, so the rows are on the heap where the size query can see
+/// them rather than in a toast table it does not list.
+async fn seed_heavy(dsn: &str, table: &str, how_many: i64) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    sess.execute(&format!("drop table if exists public.{table}"), &[])
+        .await
+        .expect("clear");
+    sess.execute(
+        &format!("create table public.{table} (id bigint primary key, pad text)"),
+        &[],
+    )
+    .await
+    .expect("make the table");
+    sess.execute(
+        &format!(
+            "insert into public.{table}
+             select g, repeat('x', 200) from generate_series(1, $1::bigint) g"
+        ),
+        &[&how_many],
+    )
+    .await
+    .expect("fill the table");
+    // The row count the usage view prints is the planner's estimate, and
+    // the planner has no estimate for a table nobody has analysed.
+    sess.execute(&format!("analyze public.{table}"), &[])
+        .await
+        .expect("analyse");
+    sess.commit().await.expect("park");
+}
+
+async fn forget_heavy(dsn: &str, table: &str) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    sess.execute(&format!("drop table if exists public.{table}"), &[])
+        .await
+        .expect("drop the table");
+    sess.commit().await.expect("park");
+}
+
+#[tokio::test]
+async fn usage_says_how_large_the_project_is_and_which_relation_made_it_that_way() {
+    let Some(dsn) = dsn() else { return };
+    let table = "consoleheavy";
+    seed_heavy(&dsn, table, 5000).await;
+    let body = fetched(&app(&dsn), "/_zou/api/usage").await;
+
+    let db = &body["database"];
+    assert!(db["name"].is_string(), "a database has a name");
+    assert!(
+        db["bytes"].as_i64().unwrap_or(0) > 0,
+        "a database with tables in it occupies something: {db}"
+    );
+    // The seed committed, so at least one transaction has committed.
+    assert!(db["commits"].as_i64().unwrap_or(0) > 0, "{db}");
+    assert!(db["blocks_hit"].as_i64().is_some(), "{db}");
+
+    let listed = body["relations"].as_array().expect("a list of relations");
+    let heavy = listed
+        .iter()
+        .find(|r| r["name"] == table)
+        .unwrap_or_else(|| panic!("the seeded table is one of the largest: {listed:?}"));
+    assert_eq!(heavy["schema"], "public");
+    assert_eq!(heavy["kind"], "r");
+    let table_bytes = heavy["table_bytes"].as_i64().expect("a table size");
+    let index_bytes = heavy["index_bytes"].as_i64().expect("an index size");
+    // Five thousand rows of a little over two hundred bytes each, so the
+    // heap is a megabyte give or take and the primary key is not empty.
+    assert!(table_bytes > 1_000_000, "heap of 5000 rows: {heavy}");
+    assert!(index_bytes > 0, "a primary key takes pages: {heavy}");
+    assert_eq!(
+        heavy["total_bytes"].as_i64(),
+        Some(table_bytes + index_bytes),
+        "the total is the two halves: {heavy}"
+    );
+    let rows = heavy["rows"].as_f64().expect("an analysed estimate");
+    assert!((4900.0..5100.0).contains(&rows), "estimate was {rows}");
+
+    // The count and the total are over everything that matched, not over
+    // the page, so both have to hold at least what one relation of the
+    // page holds.
+    assert!(
+        body["relation_count"].as_i64().unwrap_or(0) >= listed.len() as i64,
+        "{body}"
+    );
+    assert!(
+        body["relation_bytes"].as_i64().unwrap_or(0) >= table_bytes + index_bytes,
+        "{body}"
+    );
+    forget_heavy(&dsn, table).await;
+}
+
 #[tokio::test]
 async fn listing_objects_without_saying_which_bucket_is_a_bad_request() {
     let Some(dsn) = dsn() else { return };

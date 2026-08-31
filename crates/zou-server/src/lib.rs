@@ -1289,6 +1289,7 @@ pub fn routed(cfg: Config) -> Result<(Router, Arc<App>), String> {
         .route("/_zou/api/buckets", get(console::buckets))
         .route("/_zou/api/objects", get(console::objects))
         .route("/_zou/api/audit", get(console::audit))
+        .route("/_zou/api/usage", get(console::usage))
         .route("/_zou/api/sql", post(console::run))
         .route("/storage/v1/s3", get(s3::list_buckets))
         .route("/storage/v1/s3/", get(s3::list_buckets))
@@ -2011,6 +2012,7 @@ mod tests {
             "/_zou/api/buckets",
             "/_zou/api/objects?bucket=avatars",
             "/_zou/api/audit?q=&page=0",
+            "/_zou/api/usage",
         ] {
             assert_eq!(list(path, None).await, StatusCode::UNAUTHORIZED, "{path}");
             assert_eq!(

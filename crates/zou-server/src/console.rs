@@ -1,6 +1,6 @@
 //! The web admin at `/_zou`.
 //!
-//! One page and six endpoints, served by the same binary that serves
+//! One page and seven endpoints, served by the same binary that serves
 //! the project. There is no build step, no bundler and nothing fetched
 //! from a CDN: the page is a single file compiled into the binary, so
 //! an operator who can reach the server can reach the console, on a box
@@ -210,6 +210,78 @@ select l.id::text as id,
     or l.ip_address ilike $2::text
  order by l.created_at desc nulls last, l.id
  limit $3::bigint offset $4::bigint";
+
+/// How large this database is and what has gone through it.
+///
+/// Two different kinds of number in one row, on purpose. The size is
+/// what the database occupies right now, which is what a disk bill is
+/// made of. The counters are totals since the last reset, which is what
+/// a rate is made of: nobody reads `xact_commit` as a number, they read
+/// two of them a minute apart. So `counting_since` is in the row too,
+/// because a total with no start to it is not a measurement, and on a
+/// node that has been up an hour it is a very different number than on
+/// one that has been up a year.
+///
+/// The size is the whole database, catalog included, rather than the sum
+/// of the relations listed below. Those two do not match and should not:
+/// what postgres keeps about a project is part of what the project
+/// costs.
+const USAGE_DATABASE: &str = "\
+select current_database()::text as name,
+       pg_database_size(current_database()) as bytes,
+       d.numbackends::bigint as connections,
+       d.xact_commit as commits,
+       d.xact_rollback as rollbacks,
+       d.blks_read as blocks_read,
+       d.blks_hit as blocks_hit,
+       d.tup_returned as rows_returned,
+       d.tup_fetched as rows_fetched,
+       d.tup_inserted as rows_inserted,
+       d.tup_updated as rows_updated,
+       d.tup_deleted as rows_deleted,
+       d.deadlocks as deadlocks,
+       d.temp_bytes as temp_bytes,
+       date_trunc('second', d.stats_reset)::text as counting_since
+  from pg_stat_database d
+ where d.datname = current_database()";
+
+/// The largest relations in the project, with the table and the indexes
+/// on it counted apart.
+///
+/// Apart because they are two different answers to why something is
+/// large. A table that is mostly index is one somebody has indexed twice
+/// over, which is a thing to go and look at, and a table that is mostly
+/// table is just a table with rows in it.
+///
+/// The two window functions are the count and the total over everything
+/// that matched, computed before the limit cuts the list, so a project
+/// with four thousand relations gets an honest total under a list of the
+/// fifty worth reading rather than a total of the fifty. They cost
+/// another size lookup a relation, which is a stat of a directory and
+/// the reason this is a page somebody opens rather than one that is
+/// always up.
+///
+/// Row counts are the planner's estimate for the same reason the sidebar
+/// uses it: counting them is reading the whole project to draw a table
+/// of how large the project is.
+const USAGE_RELATIONS: &str = "\
+select n.nspname::text as schema,
+       c.relname::text as name,
+       c.relkind::text as kind,
+       pg_total_relation_size(c.oid) as total_bytes,
+       pg_table_size(c.oid) as table_bytes,
+       pg_indexes_size(c.oid) as index_bytes,
+       c.reltuples::float8 as rows,
+       count(*) over () as relations,
+       (sum(pg_total_relation_size(c.oid)) over ())::bigint as all_bytes
+  from pg_class c
+  join pg_namespace n on n.oid = c.relnamespace
+ where c.relkind in ('r', 'm', 'p')
+   and n.nspname not in ('pg_catalog', 'information_schema')
+   and n.nspname not like 'pg_toast%'
+   and n.nspname not like 'pg_temp%'
+ order by pg_total_relation_size(c.oid) desc, n.nspname, c.relname
+ limit $1::bigint";
 
 /// What the console will not run in one request, in bytes. Large
 /// enough for a migration somebody pasted in, small enough that a
@@ -747,6 +819,111 @@ pub async fn audit(
     )
 }
 
+/// GET /_zou/api/usage, how large this project is and how busy it has
+/// been.
+///
+/// The question behind it is always one of two, and they arrive
+/// together: the disk is filling up and nobody knows which table is
+/// doing it, or something is slow and nobody knows whether this database
+/// is reading from memory or from the disk. Both are one query against
+/// the catalog and neither is a thing somebody should have to remember
+/// the name of at three in the morning.
+///
+/// No probe, no sampling and nothing kept between requests. Every number
+/// here is one postgres already had: the sizes are the files on disk and
+/// the counters are the ones the statistics collector has been keeping
+/// since it was last reset. A console that kept its own history would be
+/// a monitoring system, and the node already exports one to a scraper on
+/// the ops port.
+pub async fn usage(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let pool = match admitted(&app, &req) {
+        Ok(pool) => pool,
+        Err(res) => return *res,
+    };
+    let sess = match pool.unscoped().await {
+        Ok(sess) => sess,
+        Err(e) => return refused(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    let database = match sess.query(USAGE_DATABASE, &[]).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
+    let relations = match sess.query(USAGE_RELATIONS, &[&LIST_PAGE]).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
+    if let Err(e) = sess.commit().await {
+        return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+    }
+    let about = database.first().map(|row| {
+        serde_json::json!({
+            "name": row.get::<_, String>("name"),
+            "bytes": row.get::<_, Option<i64>>("bytes"),
+            "connections": row.get::<_, Option<i64>>("connections"),
+            "commits": row.get::<_, Option<i64>>("commits"),
+            "rollbacks": row.get::<_, Option<i64>>("rollbacks"),
+            "blocks_read": row.get::<_, Option<i64>>("blocks_read"),
+            "blocks_hit": row.get::<_, Option<i64>>("blocks_hit"),
+            "rows_returned": row.get::<_, Option<i64>>("rows_returned"),
+            "rows_fetched": row.get::<_, Option<i64>>("rows_fetched"),
+            "rows_inserted": row.get::<_, Option<i64>>("rows_inserted"),
+            "rows_updated": row.get::<_, Option<i64>>("rows_updated"),
+            "rows_deleted": row.get::<_, Option<i64>>("rows_deleted"),
+            "deadlocks": row.get::<_, Option<i64>>("deadlocks"),
+            "temp_bytes": row.get::<_, Option<i64>>("temp_bytes"),
+            // Null on a node whose counters have never been reset, which
+            // is most of them: the totals then run from when the cluster
+            // was created.
+            "counting_since": row.get::<_, Option<String>>("counting_since"),
+        })
+    });
+    // Both come off the first row, since the window functions put the
+    // same pair on every one of them. An empty answer is a project with
+    // no relations of its own, which is a new database and not an error.
+    let counted: i64 = relations
+        .first()
+        .and_then(|row| row.get::<_, Option<i64>>("relations"))
+        .unwrap_or(0);
+    let occupied: i64 = relations
+        .first()
+        .and_then(|row| row.get::<_, Option<i64>>("all_bytes"))
+        .unwrap_or(0);
+    let listed: Vec<serde_json::Value> = relations
+        .iter()
+        .map(|row| {
+            let estimate: f64 = row.get("rows");
+            serde_json::json!({
+                "schema": row.get::<_, String>("schema"),
+                "name": row.get::<_, String>("name"),
+                "kind": row.get::<_, String>("kind"),
+                "total_bytes": row.get::<_, Option<i64>>("total_bytes"),
+                "table_bytes": row.get::<_, Option<i64>>("table_bytes"),
+                "index_bytes": row.get::<_, Option<i64>>("index_bytes"),
+                "rows": if estimate < 0.0 { serde_json::Value::Null }
+                        else { serde_json::Value::from(estimate) },
+            })
+        })
+        .collect();
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({
+            "database": about,
+            "relations": listed,
+            "relation_count": counted,
+            "relation_bytes": occupied,
+        }),
+    )
+}
+
 /// POST /_zou/api/sql, run what the editor holds.
 ///
 /// The simple protocol, so a person can paste several statements and
@@ -914,6 +1091,7 @@ mod tests {
         assert!(PAGE.contains("/_zou/api/buckets"));
         assert!(PAGE.contains("/_zou/api/objects?bucket="));
         assert!(PAGE.contains("/_zou/api/audit?q="));
+        assert!(PAGE.contains("/_zou/api/usage"));
     }
 
     #[test]
