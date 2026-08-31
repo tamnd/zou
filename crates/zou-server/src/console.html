@@ -247,6 +247,11 @@ function draw(schemas) {
   trail.appendChild(document.createTextNode("audit"));
   trail.onclick = function () { term = ""; page = 0; audit(); };
   tree.appendChild(trail);
+  var cost = el("button");
+  cost.type = "button";
+  cost.appendChild(document.createTextNode("usage"));
+  cost.onclick = function () { term = ""; page = 0; usage(); };
+  tree.appendChild(cost);
   schemas.forEach(function (schema) {
     tree.appendChild(el("h2", schema.name));
     schema.relations.forEach(function (relation) {
@@ -526,6 +531,116 @@ function audit() {
       pager(answer.body.more, audit);
       find.focus();
     }, function (e) { complain(String(e)); });
+}
+
+// A whole number with the separators a person reads. Counters here run
+// to the hundreds of millions on a busy project and an unbroken run of
+// digits is one nobody can tell from the run of digits above it.
+function count(n) {
+  if (n === null || n === undefined) return "";
+  return Math.round(n).toLocaleString("en-US");
+}
+
+// Two columns, a name and a number. Not a th, because neither column is
+// a heading of the other: it is a list of facts about one thing.
+function fact(table, name, value, cls) {
+  var tr = el("tr");
+  tr.appendChild(el("td", name, "dim"));
+  tr.appendChild(el("td", value, cls));
+  table.appendChild(tr);
+}
+
+// How large this project is and what has gone through it.
+function usage() {
+  listing();
+  note.textContent = "measuring";
+  ask("/_zou/api/usage").then(function (answer) {
+    note.textContent = "";
+    if (answer.status !== 200) {
+      complain(answer.body.error || ("HTTP " + answer.status));
+      return;
+    }
+    clear(out);
+    var db = answer.body.database;
+    if (db) {
+      note.textContent = db.name + ", " + bytes(db.bytes);
+      var facts = el("table");
+      fact(facts, "database", db.name);
+      fact(facts, "on disk", bytes(db.bytes));
+      fact(facts, "tables and indexes", bytes(answer.body.relation_bytes)
+        + " over " + count(answer.body.relation_count)
+        + (answer.body.relation_count === 1 ? " relation" : " relations"));
+      fact(facts, "connections", count(db.connections));
+      // The one ratio worth printing. Under about 99 percent on a
+      // project that fits in memory means it is not in memory, which is
+      // the answer to most of the questions that bring somebody here.
+      var looked = db.blocks_hit + db.blocks_read;
+      if (looked > 0) {
+        var share = (db.blocks_hit * 100) / looked;
+        fact(facts, "blocks from cache", share.toFixed(1) + " percent, "
+          + count(db.blocks_read) + " read from disk",
+          share < 90 ? "warn" : "");
+      } else {
+        fact(facts, "blocks from cache", "nothing read yet", "dim");
+      }
+      fact(facts, "transactions", count(db.commits) + " committed, "
+        + count(db.rollbacks) + " rolled back");
+      fact(facts, "rows written", count(db.rows_inserted) + " inserted, "
+        + count(db.rows_updated) + " updated, "
+        + count(db.rows_deleted) + " deleted");
+      fact(facts, "rows read", count(db.rows_fetched) + " fetched of "
+        + count(db.rows_returned) + " returned");
+      // Any at all is worth the colour. A deadlock is two transactions
+      // that could not both go on and one of them was killed for it.
+      fact(facts, "deadlocks", count(db.deadlocks),
+        db.deadlocks > 0 ? "warn" : "dim");
+      fact(facts, "temporary files", bytes(db.temp_bytes),
+        db.temp_bytes > 0 ? "" : "dim");
+      // A total with no start to it is not a measurement, and on a node
+      // that has been up an hour it means something very different than
+      // on one that has been up a year.
+      fact(facts, "counting since",
+        db.counting_since || "the cluster was created",
+        db.counting_since ? "" : "dim");
+      out.appendChild(facts);
+      out.appendChild(el("p", "Sizes are what is on disk now. Everything "
+        + "under them is a total since the counters were last reset, so "
+        + "the number to read is the difference between two of these.",
+        "tag"));
+    }
+    var list = answer.body.relations;
+    if (!list.length) {
+      out.appendChild(el("p", "This database has no relations of its own.",
+        "tag"));
+      return;
+    }
+    if (answer.body.relation_count > list.length) {
+      out.appendChild(el("p", "The " + list.length + " largest of "
+        + count(answer.body.relation_count) + ".", "tag"));
+    }
+    var head = el("tr");
+    ["relation", "kind", "rows", "table", "indexes", "total"]
+      .forEach(function (name) { head.appendChild(el("th", name)); });
+    var table = el("table");
+    table.appendChild(head);
+    var kinds = { r: "table", m: "materialized view", p: "partitioned" };
+    list.forEach(function (r) {
+      var tr = el("tr");
+      tr.appendChild(el("td", r.schema + "." + r.name));
+      tr.appendChild(el("td", kinds[r.kind] || r.kind, "dim"));
+      tr.appendChild(el("td", r.rows === null ? "" : "~" + count(r.rows),
+        "dim"));
+      tr.appendChild(el("td", bytes(r.table_bytes)));
+      // A table that is mostly index is one somebody has indexed twice
+      // over, which is worth seeing beside the table it indexes rather
+      // than folded into one number with it.
+      tr.appendChild(el("td", bytes(r.index_bytes),
+        r.index_bytes > r.table_bytes ? "warn" : ""));
+      tr.appendChild(el("td", bytes(r.total_bytes)));
+      table.appendChild(tr);
+    });
+    out.appendChild(table);
+  }, function (e) { complain(String(e)); });
 }
 
 function run() {
