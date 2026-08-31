@@ -94,7 +94,10 @@ const USERS_PAGE: i64 = 50;
 /// Every timestamp is cast to text in the query rather than decoded
 /// here, for the reason the sql editor returns text: what a console
 /// should print is what postgres would have written, not a driver's
-/// rendering of a type and a timezone it had to pick.
+/// rendering of a type and a timezone it had to pick. Truncated to the
+/// second first, because the microseconds of a signup are ten
+/// characters of noise and the columns they push off the side of the
+/// screen are ones somebody came to read.
 ///
 /// The search is one term against the email, the phone and the id,
 /// because those are the three things somebody has in front of them
@@ -103,8 +106,8 @@ const USERS: &str = "\
 select u.id::text as id,
        u.email::text as email,
        u.phone::text as phone,
-       u.created_at::text as created_at,
-       u.last_sign_in_at::text as last_sign_in_at,
+       date_trunc('second', u.created_at)::text as created_at,
+       date_trunc('second', u.last_sign_in_at)::text as last_sign_in_at,
        (u.email_confirmed_at is not null
         or u.phone_confirmed_at is not null) as confirmed,
        u.is_anonymous as anonymous,
@@ -295,10 +298,12 @@ fn group(rows: &[tokio_postgres::Row]) -> serde_json::Value {
 /// answering it in the sql editor means knowing that `auth.users` and
 /// `auth.identities` exist and how they join.
 ///
-/// A node with no auth schema on it is not an error. Auth is one of the
-/// surfaces a project can be running without, so the answer is an empty
-/// list that says so, and the page prints a sentence rather than a
-/// stack of postgres words about a relation that does not exist.
+/// A database with no `auth.users` on it answers with an empty list
+/// that says so rather than with postgres's words about a relation that
+/// does not exist. Bootstrap makes that table on every database this
+/// server opens, so the only way to be here is a database somebody
+/// dropped the schema on, which is a strange state to be in and a worse
+/// one to read a 42P01 about.
 pub async fn users(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     req: Request<Body>,
