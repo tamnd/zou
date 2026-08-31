@@ -691,19 +691,22 @@ async fn creating_refuses_what_upstream_refuses() {
         )
     );
 
-    // The address is validated the same way it is on the open surface,
-    // and an account with a phone number is a surface this end does not
-    // serve yet rather than one it pretends to.
+    // The address and the number are both validated the same way they
+    // are on the open surface.
     let shape = create(&app, &aud, serde_json::json!({"email": "not an address"})).await;
     assert_eq!(shape.status, StatusCode::BAD_REQUEST, "{}", shape.body);
     assert_eq!(shape.body["error_code"], "validation_failed");
     let phone = create(
         &app,
         &aud,
-        serde_json::json!({"email": address("admin-phone"), "phone": "+15550100"}),
+        serde_json::json!({"email": address("admin-phone"), "phone": "not a number"}),
     )
     .await;
-    assert_eq!(phone.status, StatusCode::NOT_IMPLEMENTED, "{}", phone.body);
+    assert_eq!(phone.status, StatusCode::BAD_REQUEST, "{}", phone.body);
+    assert_eq!(
+        phone.body["msg"],
+        "Invalid phone number format (E.164 required)"
+    );
 
     // Nothing that was refused left a row behind.
     let count: i64 = scalar(
@@ -756,6 +759,66 @@ async fn an_account_can_be_made_with_the_id_and_the_role_it_is_asked_for() {
         "{}",
         twice.body
     );
+}
+
+#[tokio::test]
+async fn an_account_can_be_made_for_a_number_with_no_address_at_all() {
+    let Some(dsn) = dsn() else { return };
+    let app = app(&dsn);
+    let pool = Pool::new(&dsn, 4).expect("pool");
+    let aud = audience("bynumber");
+    wipe(&pool, &aud).await;
+    let phone = "15550190001";
+
+    let made = create(
+        &app,
+        &aud,
+        serde_json::json!({"phone": phone, "password": "correct horse",
+                           "phone_confirm": true}),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::OK, "{}", made.body);
+    assert_eq!(made.body["phone"], phone);
+    assert_eq!(made.body["email"], "");
+    assert_eq!(made.body["app_metadata"]["provider"], "phone");
+    assert_eq!(
+        made.body["app_metadata"]["providers"],
+        serde_json::json!(["phone"])
+    );
+    assert!(!made.body["phone_confirmed_at"].is_null());
+    // The identity an operator writes carries the number, and the
+    // metadata is left as the request sent it, which for a request that
+    // sent none is nothing at all.
+    let identity = &made.body["identities"][0];
+    assert_eq!(identity["provider"], "phone");
+    assert_eq!(identity["identity_data"]["phone"], phone);
+    assert_eq!(identity["identity_data"]["phone_verified"], false);
+    assert_eq!(made.body["user_metadata"], serde_json::json!({}));
+
+    // The number is spoken for now, and the refusal names it rather
+    // than the address the request never sent.
+    let twice = create(
+        &app,
+        &aud,
+        serde_json::json!({"phone": phone, "password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(
+        twice.refusal(),
+        (
+            422,
+            "phone_exists",
+            "Phone number already registered by another user"
+        )
+    );
+
+    let count: i64 = scalar(
+        &pool,
+        "select count(*) from auth.users where aud = $1",
+        &[&aud],
+    )
+    .await;
+    assert_eq!(count, 1);
 }
 
 // Reading.

@@ -441,7 +441,11 @@ async fn a_phone_signup_texts_a_code_and_the_code_confirms_the_number() {
         &[&phone],
     )
     .await;
-    assert!(verified, "the identity says what the provider asserted");
+    assert!(
+        !verified,
+        "and the identity still says nothing, which is upstream's and \
+         is what the column on the account is for"
+    );
 }
 
 #[tokio::test]
@@ -1791,7 +1795,7 @@ async fn a_provider_that_keeps_its_own_codes_is_asked_rather_than_the_column() {
         &[&phone],
     )
     .await;
-    assert!(verified, "and the identity says so");
+    assert!(!verified, "and the identity is left as the signup wrote it");
 }
 
 #[tokio::test]

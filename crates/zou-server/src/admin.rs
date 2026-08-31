@@ -44,6 +44,11 @@ const PER_PAGE: u64 = 50;
 
 const DUPLICATE_EMAIL: &str = "A user with this email address has already been registered";
 
+/// The number that is spoken for. Upstream says this here and says
+/// something else on the signup path for the same collision, and both
+/// wordings are kept where they are said.
+const DUPLICATE_PHONE: &str = "Phone number already registered by another user";
+
 /// Who is asking, for the endpoints where that is a role rather than a
 /// person. `holder` is filled only when the token names one, which an
 /// ordinary service_role key does not: it carries no sub claim and never
@@ -911,16 +916,31 @@ async fn create(
             "Cannot create a user without either an email or phone",
         );
     }
-    let email = validate_email(email)?;
-    if taken(sess, &email, NOBODY).await? {
+    // Either one on its own is an account, so each is checked only when
+    // it was sent. An address is looked at before a number because that
+    // is the order upstream reads them in, and a request carrying two
+    // that are both spoken for is refused for the address.
+    let email = match email.is_empty() {
+        true => String::new(),
+        false => validate_email(email)?,
+    };
+    if !email.is_empty() && taken(sess, &email, NOBODY).await? {
         return Err(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
             "email_exists",
             DUPLICATE_EMAIL,
         ));
     }
-    if !phone.is_empty() {
-        return Err(Error::NotYet("creating a user with a phone number"));
+    let phone = match phone.is_empty() {
+        true => String::new(),
+        false => crate::auth::validate_phone(phone)?,
+    };
+    if !phone.is_empty() && crate::auth::held_by_another(sess, &phone, NOBODY).await? {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "phone_exists",
+            DUPLICATE_PHONE,
+        ));
     }
     let hash = secret(body).await?;
     let id = match field(body, "id") {
@@ -939,6 +959,7 @@ async fn create(
         given => given,
     };
     let confirm = flag(body, "email_confirm");
+    let confirm_number = flag(body, "phone_confirm");
     let user_data = match object(body, "user_metadata") {
         serde_json::Value::Null => serde_json::json!({}),
         data => data,
@@ -947,6 +968,7 @@ async fn create(
         sess,
         &NewAccount {
             email: &email,
+            phone: &phone,
             aud,
             hash: &hash,
             data: &user_data,
@@ -955,24 +977,37 @@ async fn create(
         },
     )
     .await?;
-    // The identity is what says the account belongs to the email
-    // provider. It goes in unverified whatever the request said, and
-    // email_confirm below is what verifies it, which is the order
-    // upstream writes them in too.
-    insert_identity(sess, &user_id, &email).await?;
+    // The identity is what says the account belongs to the provider it
+    // signed up through. It goes in unverified whatever the request
+    // said, and the two confirm flags below are what verify it, which is
+    // the order upstream writes them in too. An account made with both
+    // an address and a number gets one of each.
+    if !email.is_empty() {
+        insert_identity(sess, &user_id, &email).await?;
+    }
+    if !phone.is_empty() {
+        insert_phone_identity(sess, &user_id, &phone).await?;
+    }
     let app_data = object(body, "app_metadata");
     if !app_data.is_null() {
         merge_metadata(sess, &user_id, "raw_app_meta_data", &app_data).await?;
     }
-    if confirm {
+    if confirm && !email.is_empty() {
         confirm_user_row(sess, &user_id, false).await?;
+    }
+    if confirm_number && !phone.is_empty() {
+        crate::auth::confirm_phone(sess, &user_id).await?;
     }
     ban_account(sess, &user_id, ban).await?;
     // An account made by an admin is filed as a signup, which reads
     // oddly for something nobody asked for and is upstream's word.
     let mut traits = about(sess, &user_id).await?;
     if let Some(traits) = traits.as_object_mut() {
-        traits.insert("provider".to_string(), "email".into());
+        let provider = match email.is_empty() {
+            true => "phone",
+            false => "email",
+        };
+        traits.insert("provider".to_string(), provider.into());
     }
     audit::record(
         sess,
@@ -1019,6 +1054,9 @@ async fn about(sess: &sql::Session, user_id: &str) -> Result<serde_json::Value, 
 /// has signed up with yet.
 struct NewAccount<'a> {
     email: &'a str,
+    /// The number, stripped, and empty for the two of these that have no
+    /// way of carrying one.
+    phone: &'a str,
     aud: &'a str,
     /// The stored password, which for an invited account is empty,
     /// because there is nothing to sign in with until the invitation is
@@ -1033,8 +1071,13 @@ struct NewAccount<'a> {
 async fn insert_account(sess: &sql::Session, new: &NewAccount<'_>) -> Result<String, sql::Error> {
     let rows = sess
         .query(
+            // The provider is the address when there is one and the
+            // number otherwise, and an account made with both is filed
+            // under both. An empty address goes in as null rather than
+            // as the empty string, because the column is unique and two
+            // accounts made by number would collide on it.
             "insert into auth.users
-                 (instance_id, id, aud, role, email, encrypted_password,
+                 (instance_id, id, aud, role, email, phone, encrypted_password,
                   raw_app_meta_data, raw_user_meta_data,
                   confirmation_token, recovery_token, email_change_token_current,
                   email_change_token_new, email_change, phone_change, phone_change_token,
@@ -1042,13 +1085,18 @@ async fn insert_account(sess: &sql::Session, new: &NewAccount<'_>) -> Result<Str
                   is_anonymous, is_sso_user)
              values ($7::text::uuid,
                      coalesce($6::text::uuid, gen_random_uuid()),
-                     $2, $5, $1, $3, jsonb_build_object('provider', 'email',
-                                                        'providers',
-                                                        jsonb_build_array('email')),
+                     $2, $5, nullif($1, ''), nullif($8, ''), $3,
+                     jsonb_build_object(
+                         'provider', case when $1 = '' then 'phone' else 'email' end,
+                         'providers',
+                         (case when $1 = '' then '[]'::jsonb
+                               else jsonb_build_array('email') end)
+                         || (case when $8 = '' then '[]'::jsonb
+                                  else jsonb_build_array('phone') end)),
                      $4::jsonb, '', '', '', '', '', '', '', '', now(), now(), false, false)
              returning id::text",
             &[
-                &new.email, &new.aud, &new.hash, &new.data, &new.role, &new.id, &NOBODY,
+                &new.email, &new.aud, &new.hash, &new.data, &new.role, &new.id, &NOBODY, &new.phone,
             ],
         )
         .await?;
@@ -1072,6 +1120,31 @@ async fn insert_identity(
           where not exists (select 1 from auth.identities
                              where user_id = $1::text::uuid and provider = 'email')",
         &[&user_id, &email],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The phone identity, unverified, and only when the account has none.
+/// This one carries the number, where the identity a signup writes does
+/// not, because the claims upstream fills in on this path name the phone
+/// and the ones it fills in on that one leave it empty.
+async fn insert_phone_identity(
+    sess: &sql::Session,
+    user_id: &str,
+    phone: &str,
+) -> Result<(), sql::Error> {
+    sess.execute(
+        "insert into auth.identities
+             (provider_id, user_id, identity_data, provider,
+              last_sign_in_at, created_at, updated_at)
+         select $1::text::uuid::text, $1::text::uuid,
+                jsonb_build_object('sub', $1::text, 'phone', $2::text,
+                                   'email_verified', false, 'phone_verified', false),
+                'phone', now(), now(), now()
+          where not exists (select 1 from auth.identities
+                             where user_id = $1::text::uuid and provider = 'phone')",
+        &[&user_id, &phone],
     )
     .await?;
     Ok(())
@@ -1761,6 +1834,7 @@ async fn new_account(
         sess,
         &NewAccount {
             email,
+            phone: "",
             aud,
             hash,
             data,
